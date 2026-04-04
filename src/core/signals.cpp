@@ -10,6 +10,23 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include <dbghelp.h>
+#pragma comment(lib, "dbghelp.lib")
+
+static void WriteMiniDump(EXCEPTION_POINTERS* pExp) {
+    HANDLE hFile = CreateFileA("shadps4_crash.dmp", GENERIC_WRITE, 0, nullptr,
+                                CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hFile != INVALID_HANDLE_VALUE) {
+        MINIDUMP_EXCEPTION_INFORMATION mei{};
+        mei.ThreadId = GetCurrentThreadId();
+        mei.ExceptionPointers = pExp;
+        mei.ClientPointers = FALSE;
+        MiniDumpWriteDump(GetCurrentProcess(), GetCurrentProcessId(), hFile,
+                          static_cast<MINIDUMP_TYPE>(MiniDumpWithDataSegs | MiniDumpWithThreadInfo | MiniDumpWithFullMemoryInfo),
+                          &mei, nullptr, nullptr);
+        CloseHandle(hFile);
+    }
+}
 #else
 #include <csignal>
 #include <pthread.h>
@@ -49,6 +66,9 @@ static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
         break;
     }
 
+    if (!handled) {
+        WriteMiniDump(pExp);
+    }
     return handled ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
 }
 
