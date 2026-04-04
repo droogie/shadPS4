@@ -261,7 +261,7 @@ endif()
 
 add_subdirectory(aacdec)
 
-#nlohmann json 
+#nlohmann json
 if (NOT TARGET nlohmann_json::nlohmann_json)
 set(JSON_BuildTests OFF CACHE INTERNAL "")
 add_subdirectory(json)
@@ -316,4 +316,8 @@ endif()
 # cpp-httplib
 add_library(Cpp_Httplib INTERFACE)
 target_include_directories(Cpp_Httplib INTERFACE cpp-httplib/)
+
+# easywsclient
+add_library(easywsclient STATIC easywsclient/easywsclient.cpp)
+target_include_directories(easywsclient PUBLIC easywsclient/)
 

@@ -1,8 +1,12 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
+#include <cstring>
 #include <map>
 #include <mutex>
+#include <unordered_map>
+#include <unordered_set>
 #include <variant>
 
 #include "common/config.h"
@@ -11,6 +15,9 @@
 #include "core/libraries/libs.h"
 #include "core/libraries/np/np_error.h"
 #include "core/libraries/np/np_manager.h"
+#include "core/libraries/np/np_matching2.h"
+#include "core/libraries/np/np_signaling.h"
+#include "core/libraries/system/userservice.h"
 #include "core/tls.h"
 
 namespace Libraries::Np::NpManager {
@@ -700,6 +707,65 @@ struct NpStateCallbackForNpToolkit {
 
 NpStateCallbackForNpToolkit NpStateCbForNp;
 
+// sceNpRegisterStateCallback stores a 4-arg callback.
+struct NpStateCallbackInfo {
+    OrbisNpStateCallback func = nullptr;
+    void* userdata = nullptr;
+};
+
+static NpStateCallbackInfo g_np_state_callback;
+static bool g_np_callback_dispatched = false;
+
+// PS Plus event callback (registered via sceNpRegisterPlusEventCallback).
+// On real PS4, sceNpNotifyPlusFeature triggers the system to check Plus status
+// and fire this callback. Games gate multiplayer features behind this callback.
+using OrbisNpPlusEventCallback = PS4_SYSV_ABI void (*)(
+    Libraries::UserService::OrbisUserServiceUserId userId, s32 event, void* userdata);
+
+struct NpPlusCallbackInfo {
+    OrbisNpPlusEventCallback func = nullptr;
+    void* userdata = nullptr;
+};
+
+static NpPlusCallbackInfo g_plus_callback;
+static bool g_plus_callback_dispatched = false;
+
+// --- PS Plus Feature Support ---
+// sceNpNotifyPlusFeature declares required Plus features. The system checks
+// Plus status and fires the callback from sceNpRegisterPlusEventCallback.
+// Games may gate multiplayer behind this callback.
+
+struct OrbisNpNotifyPlusFeatureParameter {
+    u64 size;
+    Libraries::UserService::OrbisUserServiceUserId user_id;
+    u8 padding[4];
+    u64 features;
+    u8 reserved[32];
+};
+
+s32 PS4_SYSV_ABI sceNpRegisterPlusEventCallback(OrbisNpPlusEventCallback callback, void* userdata) {
+    LOG_INFO(Lib_NpManager, "called callback={:p} userdata={:p}", reinterpret_cast<void*>(callback),
+             userdata);
+    g_plus_callback.func = callback;
+    g_plus_callback.userdata = userdata;
+    g_plus_callback_dispatched = false;
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceNpUnregisterPlusEventCallback() {
+    LOG_INFO(Lib_NpManager, "called");
+    g_plus_callback.func = nullptr;
+    g_plus_callback.userdata = nullptr;
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceNpNotifyPlusFeature(const OrbisNpNotifyPlusFeatureParameter* param) {
+    LOG_INFO(Lib_NpManager, "called features={:#x}", param ? param->features : 0);
+    // Mark that Plus notification was requested; callback fires from sceNpCheckCallback.
+    g_plus_callback_dispatched = false;
+    return ORBIS_OK;
+}
+
 struct NpStateCallback {
     std::variant<OrbisNpStateCallback, OrbisNpStateCallbackA> func;
     void* userdata;
@@ -708,12 +774,54 @@ struct NpStateCallback {
 NpStateCallback NpStateCb;
 
 s32 PS4_SYSV_ABI sceNpCheckCallback() {
-    LOG_DEBUG(Lib_NpManager, "(STUBBED) called");
+    // Dispatch the registered NP state callback once when signed in.
+    // On real hardware, firmware dispatches this on NP state changes.
+    // We fire it on the first call after sign-in so games detect the transition.
+    if (!g_np_callback_dispatched && g_signed_in && g_np_state_callback.func) {
+        g_np_callback_dispatched = true;
 
-    std::scoped_lock lk{g_np_callbacks_mutex};
+        // Get initial user ID for the callback.
+        Libraries::UserService::OrbisUserServiceUserId userId = 1;
+        Libraries::UserService::sceUserServiceGetInitialUser(&userId);
 
-    for (auto i : g_np_callbacks) {
-        (i.second)();
+        LOG_INFO(Lib_NpManager,
+                 "sceNpCheckCallback: dispatching NP state callback "
+                 "(userId={}, state=SignedIn, userdata={:p})",
+                 userId, g_np_state_callback.userdata);
+        g_np_state_callback.func(userId, OrbisNpState::SignedIn, nullptr,
+                                 g_np_state_callback.userdata);
+        LOG_INFO(Lib_NpManager, "sceNpCheckCallback: NP state callback returned");
+    }
+
+    // Dispatch Plus event callback after state callback has been delivered.
+    // Event type 1 (ORBIS_NP_PLUS_EVENT_RECHECK_NEEDED) tells the game to
+    // re-check Plus status via sceNpCheckPlus.
+    if (!g_plus_callback_dispatched && g_np_callback_dispatched && g_signed_in &&
+        g_plus_callback.func) {
+        g_plus_callback_dispatched = true;
+
+        Libraries::UserService::OrbisUserServiceUserId userId = 1;
+        Libraries::UserService::sceUserServiceGetInitialUser(&userId);
+
+        constexpr s32 ORBIS_NP_PLUS_EVENT_RECHECK_NEEDED = 1;
+        LOG_INFO(Lib_NpManager,
+                 "sceNpCheckCallback: dispatching Plus event callback "
+                 "(userId={}, event=RECHECK_NEEDED, userdata={:p})",
+                 userId, g_plus_callback.userdata);
+        g_plus_callback.func(userId, ORBIS_NP_PLUS_EVENT_RECHECK_NEEDED, g_plus_callback.userdata);
+        LOG_INFO(Lib_NpManager, "sceNpCheckCallback: Plus event callback returned");
+    }
+
+    // Drain NpMatching2 first, then NpSignaling (matching must complete before signaling).
+    NpMatching2::DrainReadyEvents();
+    NpSignaling::DrainSignalingEvents();
+
+    // Process any registered NP callbacks.
+    {
+        std::scoped_lock lk{g_np_callbacks_mutex};
+        for (auto i : g_np_callbacks) {
+            (i.second)();
+        }
     }
 
     return ORBIS_OK;
@@ -725,12 +833,14 @@ s32 PS4_SYSV_ABI sceNpCheckCallbackForLib() {
 }
 
 s32 PS4_SYSV_ABI sceNpRegisterStateCallback(OrbisNpStateCallback callback, void* userdata) {
-    static s32 id = 0;
-    LOG_ERROR(Lib_NpManager, "(STUBBED) called, userdata = {}", userdata);
+    LOG_INFO(Lib_NpManager, "called callback={:p} userdata={:p}", reinterpret_cast<void*>(callback),
+             userdata);
     NpStateCb.func = callback;
     NpStateCb.userdata = userdata;
-
-    return id;
+    g_np_state_callback.func = callback;
+    g_np_state_callback.userdata = userdata;
+    g_np_callback_dispatched = false; // reset so callback fires on next sceNpCheckCallback
+    return ORBIS_OK;
 }
 
 s32 PS4_SYSV_ABI sceNpRegisterStateCallbackA(OrbisNpStateCallbackA callback, void* userdata) {
@@ -783,6 +893,102 @@ void DeregisterNpCallback(std::string key) {
     g_np_callbacks.erase(key);
 }
 
+// --- sceNpLookup* HLE ---
+// Used during connection setup to resolve peer NpIds.
+// Flow: CreateAsyncRequest + NpId (start lookup)
+//       PollAsync (check completion)
+//       DeleteRequest (cleanup)
+
+static std::atomic<s32> s_next_lookup_handle{1};
+static std::unordered_set<s32> s_completed_lookups;
+static std::mutex s_lookup_mutex;
+
+s32 PS4_SYSV_ABI sceNpLookupCreateTitleCtx(s32 titleId, void* npId, void* param) {
+    // Returns a valid title context ID for use with sceNpLookupCreateAsyncRequest.
+    LOG_INFO(Lib_NpManager, "called titleId={} npId={} param={}", titleId, npId, param);
+    return 1;
+}
+
+s32 PS4_SYSV_ABI sceNpLookupCreateAsyncRequest(s32 titleCtxId, void* param) {
+    // Creates an async lookup request. Returns a positive request handle.
+    s32 handle = s_next_lookup_handle++;
+    LOG_INFO(Lib_NpManager, "titleCtxId={} param={} -> handle={}", titleCtxId, param, handle);
+    return handle;
+}
+
+s32 PS4_SYSV_ABI sceNpLookupNpId(s32 requestHandle, const char* onlineIdStr, void* npIdOut,
+                                 s32 option) {
+    // Resolves an online ID string to an NpId struct (36 bytes).
+    // NpId layout: online_id[16], padding[4], opt[8], reserved[8].
+    LOG_INFO(Lib_NpManager, "handle={} onlineId='{}' option={}", requestHandle,
+             onlineIdStr ? onlineIdStr : "null", option);
+
+    if (npIdOut) {
+        std::memset(npIdOut, 0, 36);
+        if (onlineIdStr) {
+            std::strncpy(static_cast<char*>(npIdOut), onlineIdStr, 15);
+        }
+    }
+
+    // Mark request as immediately complete (synchronous resolution for local peers)
+    {
+        std::lock_guard lock(s_lookup_mutex);
+        s_completed_lookups.insert(requestHandle);
+    }
+
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceNpLookupPollAsync(s32 requestHandle, s32* result) {
+    // Returns 0 if completed, 1 if still pending. *result >= 0 on success.
+    LOG_INFO(Lib_NpManager, "handle={}", requestHandle);
+
+    if (result) {
+        *result = 0; // success
+    }
+
+    return 0; // completed
+}
+
+s32 PS4_SYSV_ABI sceNpLookupDeleteRequest(s32 requestHandle) {
+    // Cleanup after successful poll.
+    LOG_INFO(Lib_NpManager, "handle={}", requestHandle);
+    {
+        std::lock_guard lock(s_lookup_mutex);
+        s_completed_lookups.erase(requestHandle);
+    }
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceNpLookupDeleteTitleCtx(s32 titleCtxId) {
+    LOG_INFO(Lib_NpManager, "called titleCtxId={}", titleCtxId);
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceNpLookupAbortRequest(s32 requestHandle) {
+    LOG_INFO(Lib_NpManager, "called handle={}", requestHandle);
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceNpLookupWaitAsync(s32 requestHandle, s32* result) {
+    LOG_INFO(Lib_NpManager, "handle={}", requestHandle);
+    if (result) {
+        *result = 0;
+    }
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceNpLookupCreateRequest(s32 titleCtxId, void* param) {
+    s32 handle = s_next_lookup_handle++;
+    LOG_INFO(Lib_NpManager, "titleCtxId={} -> handle={}", titleCtxId, handle);
+    return handle;
+}
+
+s32 PS4_SYSV_ABI sceNpLookupSetTimeout(s32 requestHandle, s32 timeout) {
+    LOG_INFO(Lib_NpManager, "handle={} timeout={}", requestHandle, timeout);
+    return ORBIS_OK;
+}
+
 void RegisterLib(Core::Loader::SymbolsResolver* sym) {
     g_signed_in = Config::getPSNSignedIn();
 
@@ -792,6 +998,11 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
     LIB_FUNCTION("8Z2Jc5GvGDI", "libSceNpManager", 1, "libSceNpManager", sceNpCheckNpAvailabilityA);
     LIB_FUNCTION("KfGZg2y73oM", "libSceNpManager", 1, "libSceNpManager", sceNpCheckNpReachability);
     LIB_FUNCTION("r6MyYJkryz8", "libSceNpManager", 1, "libSceNpManager", sceNpCheckPlus);
+    LIB_FUNCTION("Gaxrp3EWY-M", "libSceNpManager", 1, "libSceNpManager", sceNpNotifyPlusFeature);
+    LIB_FUNCTION("GImICnh+boA", "libSceNpManager", 1, "libSceNpManager",
+                 sceNpRegisterPlusEventCallback);
+    LIB_FUNCTION("xViqJdDgKl0", "libSceNpManager", 1, "libSceNpManager",
+                 sceNpUnregisterPlusEventCallback);
     LIB_FUNCTION("KZ1Mj9yEGYc", "libSceNpManager", 1, "libSceNpManager", sceNpGetAccountLanguage);
     LIB_FUNCTION("TPMbgIxvog0", "libSceNpManager", 1, "libSceNpManager", sceNpGetAccountLanguageA);
     LIB_FUNCTION("ilwLM4zOmu4", "libSceNpManager", 1, "libSceNpManager",
@@ -833,6 +1044,19 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
                  sceNpCheckCallbackForLib);
     LIB_FUNCTION("0c7HbXRKUt4", "libSceNpManagerForToolkit", 1, "libSceNpManager",
                  sceNpRegisterStateCallbackForToolkit);
+
+    // --- sceNpLookup* registrations (imported from libSceNpUtility) ---
+    LIB_FUNCTION("8533Q+LU7EQ", "libSceNpUtility", 1, "libSceNpUtility", sceNpLookupCreateTitleCtx);
+    LIB_FUNCTION("JA4+sS39GMs", "libSceNpUtility", 1, "libSceNpUtility",
+                 sceNpLookupCreateAsyncRequest);
+    LIB_FUNCTION("T6tnM1Uti4g", "libSceNpUtility", 1, "libSceNpUtility", sceNpLookupNpId);
+    LIB_FUNCTION("V4EVrruHuy8", "libSceNpUtility", 1, "libSceNpUtility", sceNpLookupPollAsync);
+    LIB_FUNCTION("wLaxchvEEnk", "libSceNpUtility", 1, "libSceNpUtility", sceNpLookupDeleteRequest);
+    LIB_FUNCTION("mtqDK9zkoIE", "libSceNpUtility", 1, "libSceNpUtility", sceNpLookupDeleteTitleCtx);
+    LIB_FUNCTION("eYz4v5Uek9U", "libSceNpUtility", 1, "libSceNpUtility", sceNpLookupAbortRequest);
+    LIB_FUNCTION("YX9dAus6baE", "libSceNpUtility", 1, "libSceNpUtility", sceNpLookupWaitAsync);
+    LIB_FUNCTION("iQr9UxPHUFs", "libSceNpUtility", 1, "libSceNpUtility", sceNpLookupCreateRequest);
+    LIB_FUNCTION("0MV72WO7V34", "libSceNpUtility", 1, "libSceNpUtility", sceNpLookupSetTimeout);
 
     LIB_FUNCTION("2rsFmlGWleQ", "libSceNpManagerCompat", 1, "libSceNpManager",
                  sceNpCheckNpAvailability);

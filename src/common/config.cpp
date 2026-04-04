@@ -146,6 +146,11 @@ static ConfigEntry<string> userName("shadPS4");
 static ConfigEntry<bool> isShowSplash(false);
 static ConfigEntry<string> isSideTrophy("right");
 static ConfigEntry<bool> isConnectedToNetwork(false);
+static ConfigEntry<string> httpHostOverride("localhost");
+static ConfigEntry<string> stunServer("");
+static ConfigEntry<string> npServer("");
+static ConfigEntry<int> signalingPort(0);
+static ConfigEntry<string> signalingAddr("");
 static bool enableDiscordRPC = false;
 static std::filesystem::path sys_modules_path = {};
 static std::filesystem::path fonts_path = {};
@@ -233,6 +238,26 @@ std::filesystem::path getSysModulesPath() {
         return Common::FS::GetUserPath(Common::FS::PathType::SysModuleDir);
     }
     return sys_modules_path;
+}
+
+string GetHttpHostOverride() {
+    return httpHostOverride.get();
+}
+
+string GetStunServer() {
+    return stunServer.get();
+}
+
+string GetNpServer() {
+    return npServer.get();
+}
+
+int GetSignalingPort() {
+    return signalingPort.get();
+}
+
+string GetSignalingAddr() {
+    return signalingAddr.get();
 }
 
 void setSysModulesPath(const std::filesystem::path& path) {
@@ -908,6 +933,11 @@ void load(const std::filesystem::path& path, bool is_game_specific) {
         isSideTrophy.setFromToml(general, "sideTrophy", is_game_specific);
 
         isConnectedToNetwork.setFromToml(general, "isConnectedToNetwork", is_game_specific);
+        httpHostOverride.setFromToml(general, "httpHostOverride", is_game_specific);
+        stunServer.setFromToml(general, "stunServer", is_game_specific);
+        npServer.setFromToml(general, "npServer", is_game_specific);
+        signalingPort.setFromToml(general, "signalingPort", is_game_specific);
+        signalingAddr.setFromToml(general, "signalingAddr", is_game_specific);
         defaultControllerID.setFromToml(general, "defaultControllerID", is_game_specific);
         sys_modules_path = toml::find_fs_path_or(general, "sysModulesPath", sys_modules_path);
         fonts_path = toml::find_fs_path_or(general, "fontsPath", fonts_path);
@@ -1102,6 +1132,11 @@ void save(const std::filesystem::path& path, bool is_game_specific) {
     }
     isPSNSignedIn.setTomlValue(data, "General", "isPSNSignedIn", is_game_specific);
     isConnectedToNetwork.setTomlValue(data, "General", "isConnectedToNetwork", is_game_specific);
+    httpHostOverride.setTomlValue(data, "General", "httpHostOverride", is_game_specific);
+    stunServer.setTomlValue(data, "General", "stunServer", is_game_specific);
+    npServer.setTomlValue(data, "General", "npServer", is_game_specific);
+    signalingPort.setTomlValue(data, "General", "signalingPort", is_game_specific);
+    signalingAddr.setTomlValue(data, "General", "signalingAddr", is_game_specific);
 
     cursorState.setTomlValue(data, "Input", "cursorState", is_game_specific);
     cursorHideTimeout.setTomlValue(data, "Input", "cursorHideTimeout", is_game_specific);
@@ -1224,6 +1259,11 @@ void setDefaultValues(bool is_game_specific) {
         isDevKit.set(false, is_game_specific);
         isPSNSignedIn.set(false, is_game_specific);
         isConnectedToNetwork.set(false, is_game_specific);
+        httpHostOverride.set("localhost", is_game_specific);
+        stunServer.set("", is_game_specific);
+        npServer.set("", is_game_specific);
+        signalingPort.set(0, is_game_specific);
+        signalingAddr.set("", is_game_specific);
         directMemoryAccessEnabled.set(false, is_game_specific);
         extraDmemInMbytes.set(0, is_game_specific);
     }

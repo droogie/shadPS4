@@ -31,11 +31,15 @@ enum class OrbisNpReachabilityState {
     Reachable = 2,
 };
 
+// sceNpRegisterStateCallback uses a 4-arg callback:
+//   callback(userId, state, npId, userdata)
+// npId is a valid OrbisNpId* when SignedIn, nullptr when SignedOut.
 using OrbisNpStateCallback =
     PS4_SYSV_ABI void (*)(Libraries::UserService::OrbisUserServiceUserId userId, OrbisNpState state,
                           OrbisNpId* npId, void* userdata);
 using OrbisNpStateCallbackA = PS4_SYSV_ABI void (*)(
     Libraries::UserService::OrbisUserServiceUserId userId, OrbisNpState state, void* userdata);
+// Toolkit variant uses the same 4-arg dispatch; the 3rd arg (OrbisNpId*) may be ignored.
 using OrbisNpStateCallbackForNpToolkit = PS4_SYSV_ABI void (*)(
     Libraries::UserService::OrbisUserServiceUserId userId, OrbisNpState state, void* userdata);
 using OrbisNpReachabilityStateCallback =
@@ -97,6 +101,20 @@ s32 PS4_SYSV_ABI sceNpGetNpId(Libraries::UserService::OrbisUserServiceUserId use
                               OrbisNpId* np_id);
 s32 PS4_SYSV_ABI sceNpGetOnlineId(Libraries::UserService::OrbisUserServiceUserId user_id,
                                   OrbisNpOnlineId* online_id);
+
+// --- sceNpLookup* ---
+// Used to resolve peer NpIds during connection setup.
+s32 PS4_SYSV_ABI sceNpLookupCreateTitleCtx(s32 titleId, void* npId, void* param);
+s32 PS4_SYSV_ABI sceNpLookupCreateAsyncRequest(s32 titleCtxId, void* param);
+s32 PS4_SYSV_ABI sceNpLookupNpId(s32 requestHandle, const char* onlineIdStr, void* npIdOut,
+                                 s32 option);
+s32 PS4_SYSV_ABI sceNpLookupPollAsync(s32 requestHandle, s32* result);
+s32 PS4_SYSV_ABI sceNpLookupDeleteRequest(s32 requestHandle);
+s32 PS4_SYSV_ABI sceNpLookupDeleteTitleCtx(s32 titleCtxId);
+s32 PS4_SYSV_ABI sceNpLookupAbortRequest(s32 requestHandle);
+s32 PS4_SYSV_ABI sceNpLookupWaitAsync(s32 requestHandle, s32* result);
+s32 PS4_SYSV_ABI sceNpLookupCreateRequest(s32 titleCtxId, void* param);
+s32 PS4_SYSV_ABI sceNpLookupSetTimeout(s32 requestHandle, s32 timeout);
 
 void RegisterLib(Core::Loader::SymbolsResolver* sym);
 } // namespace Libraries::Np::NpManager

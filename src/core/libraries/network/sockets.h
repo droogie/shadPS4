@@ -42,6 +42,7 @@ static const GUID WSAID_WSARECVMSG = {
 #include <unistd.h>
 typedef int net_socket;
 #endif
+#include <atomic>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -82,6 +83,9 @@ struct Socket {
     virtual int GetPeerName(OrbisNetSockaddr* addr, u32* namelen) = 0;
     virtual int fstat(Libraries::Kernel::OrbisKernelStat* stat) = 0;
     virtual std::optional<net_socket> Native() = 0;
+    virtual bool HasQueuedData() {
+        return false;
+    }
     std::mutex m_mutex;
     std::mutex receive_mutex;
     int socket_type;
@@ -126,10 +130,12 @@ struct PosixSocket : public Socket {
 };
 
 struct P2PSocket : public Socket {
-    explicit P2PSocket(int domain, int type, int protocol) : Socket(domain, type, protocol) {}
-    bool IsValid() const override {
-        return true;
-    }
+    net_socket sock_;                 // reference to shared transport fd for epoll (NOT owned)
+    std::atomic<u16> bound_vport_{0}; // bound virtual port (network byte order)
+    int sockopt_so_nbio_{0};          // non-blocking mode flag
+
+    explicit P2PSocket(int domain, int type, int protocol);
+    bool IsValid() const override;
     int Close() override;
     int SetSocketOptions(int level, int optname, const void* optval, u32 optlen) override;
     int GetSocketOptions(int level, int optname, void* optval, u32* optlen) override;
@@ -145,10 +151,29 @@ struct P2PSocket : public Socket {
     int GetSocketAddress(OrbisNetSockaddr* name, u32* namelen) override;
     int GetPeerName(OrbisNetSockaddr* addr, u32* namelen) override;
     int fstat(Libraries::Kernel::OrbisKernelStat* stat) override;
+    bool HasQueuedData() override;
     std::optional<net_socket> Native() override {
+        if (IsValid())
+            return sock_;
         return {};
     }
 };
+
+// Drain the shared P2P transport socket into per-vport queues.
+// Call this before checking HasQueuedData() on P2P sockets.
+void DrainP2PTransport();
+
+// Force-create the P2P shared transport early (before STUN probe) so the
+// STUN client shares the same socket and NAT mapping as game P2P traffic.
+void EnsureP2PTransport();
+
+// Clear session-related state (learned peers, peer classifications) on session end.
+// Called from KernelP2P::ClearAll to prevent stale data from interfering.
+void ClearP2PSessionState();
+
+// Flush all buffered P2P packets from a departed peer to prevent stale data
+// from reaching the game after MemberLeft processing.
+void P2PFlushPacketsFromPeer(u32 peer_addr_nbo, u16 peer_port_nbo);
 
 struct UnixSocket : public Socket {
     net_socket sock;

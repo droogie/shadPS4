@@ -16,23 +16,13 @@ s32 PS4_SYSV_ABI sceNpCmpNpId(OrbisNpId* np_id1, OrbisNpId* np_id2) {
         return ORBIS_NP_ERROR_INVALID_ARGUMENT;
     }
 
-    // Compare data
+    // Compare handle.data only -- opt[] and reserved[] are metadata/legacy fields
+    // that differ between real PS4 (system-populated) and emulated (zero-initialized)
+    // NpIds. Identity equality depends solely on the online handle name.
     if (std::strncmp(np_id1->handle.data, np_id2->handle.data, ORBIS_NP_ONLINEID_MAX_LENGTH) != 0) {
+        LOG_DEBUG(Lib_NpCommon, "sceNpCmpNpId: MISMATCH '{:.16s}' vs '{:.16s}'",
+                  np_id1->handle.data, np_id2->handle.data);
         return ORBIS_NP_UTIL_ERROR_NOT_MATCH;
-    }
-
-    // Compare opt
-    for (u32 i = 0; i < 8; i++) {
-        if (np_id1->opt[i] != np_id2->opt[i]) {
-            return ORBIS_NP_UTIL_ERROR_NOT_MATCH;
-        }
-    }
-
-    // Compare reserved
-    for (u32 i = 0; i < 8; i++) {
-        if (np_id1->reserved[i] != np_id2->reserved[i]) {
-            return ORBIS_NP_UTIL_ERROR_NOT_MATCH;
-        }
     }
 
     return ORBIS_OK;

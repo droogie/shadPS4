@@ -133,3 +133,6 @@
 [submodule "externals/openal-soft"]
 	path = externals/openal-soft
 	url = https://github.com/shadexternals/openal-soft.git
+[submodule "externals/easywsclient"]
+	path = externals/easywsclient
+	url = https://github.com/dhbaird/easywsclient.git

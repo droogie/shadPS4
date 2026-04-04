@@ -377,6 +377,10 @@ set(NETWORK_LIBS src/core/libraries/network/http.cpp
                  src/core/libraries/network/p2p_sockets.cpp
                  src/core/libraries/network/unix_sockets.cpp
                  src/core/libraries/network/sockets.h
+                 src/core/libraries/network/kernel_p2p.cpp
+                 src/core/libraries/network/kernel_p2p.h
+                 src/core/libraries/network/stun_client.cpp
+                 src/core/libraries/network/stun_client.h
 )
 
 set(AVPLAYER_LIB src/core/libraries/avplayer/avplayer_common.cpp
@@ -596,6 +600,9 @@ set(NP_LIBS src/core/libraries/np/np_error.h
             src/core/libraries/np/np_manager.h
             src/core/libraries/np/np_matching2.cpp
             src/core/libraries/np/np_matching2.h
+            src/core/libraries/np/np_matching2_types.h
+            src/core/libraries/np/np_signaling.cpp
+            src/core/libraries/np/np_signaling.h
             src/core/libraries/np/np_score.cpp
             src/core/libraries/np/np_score.h
             src/core/libraries/np/np_trophy.cpp
@@ -606,9 +613,6 @@ set(NP_LIBS src/core/libraries/np/np_error.h
             src/core/libraries/np/trophy_ui.h
             src/core/libraries/np/np_web_api.cpp
             src/core/libraries/np/np_web_api.h
-            src/core/libraries/np/np_web_api_error.h
-            src/core/libraries/np/np_web_api_internal.cpp
-            src/core/libraries/np/np_web_api_internal.h
             src/core/libraries/np/np_web_api2.cpp
             src/core/libraries/np/np_web_api2.h
             src/core/libraries/np/np_party.cpp
@@ -1121,7 +1125,7 @@ create_target_directory_groups(shadps4)
 
 target_link_libraries(shadps4 PRIVATE magic_enum::magic_enum fmt::fmt toml11::toml11 tsl::robin_map xbyak::xbyak Tracy::TracyClient RenderDoc::API FFmpeg::ffmpeg Dear_ImGui gcn half::half ZLIB::ZLIB PNG::PNG)
 target_link_libraries(shadps4 PRIVATE Boost::headers GPUOpen::VulkanMemoryAllocator LibAtrac9 sirit Vulkan::Headers xxHash::xxhash Zydis::Zydis glslang::glslang SDL3::SDL3 SDL3_mixer::SDL3_mixer pugixml::pugixml)
-target_link_libraries(shadps4 PRIVATE stb::headers libusb::usb lfreist-hwinfo::hwinfo nlohmann_json::nlohmann_json miniz::miniz fdk-aac CLI11::CLI11 OpenAL::OpenAL Cpp_Httplib)
+target_link_libraries(shadps4 PRIVATE stb::headers libusb::usb lfreist-hwinfo::hwinfo nlohmann_json::nlohmann_json miniz::miniz fdk-aac CLI11::CLI11 OpenAL::OpenAL Cpp_Httplib easywsclient)
 
 target_compile_definitions(shadps4 PRIVATE IMGUI_USER_CONFIG="imgui/imgui_config.h")
 target_compile_definitions(Dear_ImGui PRIVATE IMGUI_USER_CONFIG="${PROJECT_SOURCE_DIR}/src/imgui/imgui_config.h")

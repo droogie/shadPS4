@@ -1,7 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
+#include <cstring>
 #include <mutex>
+#include <httplib.h>
 #include "common/config.h"
 #include "common/logging/log.h"
 #include "core/libraries/error_codes.h"
@@ -16,6 +19,8 @@ namespace Libraries::Np::NpAuth {
 static bool g_signed_in = false;
 static s32 g_active_auth_requests = 0;
 static std::mutex g_auth_request_mutex;
+
+const char* g_dummy_auth_code = "DUMMY-CODE";
 
 // Internal types for storing request-related information
 enum class NpAuthRequestState {
@@ -32,6 +37,29 @@ struct NpAuthRequest {
 };
 
 static std::vector<NpAuthRequest> g_auth_requests;
+
+static std::string ParseJsonString(const std::string& json, const std::string& key) {
+    auto kpos = json.find("\"" + key + "\"");
+    if (kpos == std::string::npos)
+        return "";
+    auto vstart = json.find('"', kpos + key.size() + 3);
+    if (vstart == std::string::npos)
+        return "";
+    auto vend = json.find('"', vstart + 1);
+    if (vend == std::string::npos)
+        return "";
+    return json.substr(vstart + 1, vend - vstart - 1);
+}
+
+static int ParseJsonInt(const std::string& json, const std::string& key) {
+    auto kpos = json.find("\"" + key + "\"");
+    if (kpos == std::string::npos)
+        return 0;
+    auto colon = json.find(':', kpos);
+    if (colon == std::string::npos)
+        return 0;
+    return std::atoi(json.c_str() + colon + 1);
+}
 
 s32 CreateNpAuthRequest(bool async) {
     if (g_active_auth_requests == ORBIS_NP_AUTH_REQUEST_LIMIT) {
@@ -119,12 +147,50 @@ s32 GetAuthorizationCode(s32 req_id, const OrbisNpAuthGetAuthorizationCodeParame
         return ORBIS_NP_ERROR_SIGNED_OUT;
     }
 
-    LOG_ERROR(Lib_NpAuth, "(STUBBED) called, req_id = {:#x}, async = {}", req_id, request.async);
+    // Try server-issued auth code
+    {
+        std::string server_host = "http://127.0.0.1:18671";
+        if (const char* env = std::getenv("SHADPS4_NP_SERVER")) {
+            server_host = env;
+        } else {
+            std::string cfg = Config::GetNpServer();
+            if (!cfg.empty()) {
+                server_host = cfg;
+                if (server_host.rfind("http://", 0) != 0 && server_host.rfind("https://", 0) != 0) {
+                    server_host = "http://" + server_host;
+                }
+            }
+        }
 
-    // Not sure what values are expected here, so zeroing these for now.
-    std::memset(auth_code, 0, sizeof(OrbisNpAuthorizationCode));
+        std::string online_id = Config::getUserName();
+        std::string body = "{\"OnlineId\": \"" + online_id + "\"}";
+
+        httplib::Client cli(server_host);
+        cli.set_connection_timeout(3);
+        cli.set_read_timeout(3);
+        auto res =
+            cli.Post("/basic_utils/np/auth/get_authorization_code", body, "application/json");
+
+        if (res && res->status == 200 && !res->body.empty()) {
+            auto code_str = ParseJsonString(res->body, "AuthorizationCode");
+            auto issuer = ParseJsonInt(res->body, "IssuerId");
+            if (!code_str.empty() && issuer > 0) {
+                std::memset(auth_code, 0, sizeof(OrbisNpAuthorizationCode));
+                std::strncpy(auth_code->code, code_str.c_str(), sizeof(auth_code->code) - 1);
+                if (issuer_id != nullptr) {
+                    *issuer_id = issuer;
+                }
+                LOG_INFO(Lib_NpAuth, "Server-issued auth code: {} issuerId={}", code_str, issuer);
+                return ORBIS_OK;
+            }
+        }
+    }
+
+    // Fallback: dummy code (offline/standalone)
+    LOG_WARNING(Lib_NpAuth, "Server unreachable, using fallback auth code");
+    std::memcpy(auth_code, g_dummy_auth_code, sizeof(OrbisNpAuthorizationCode));
     if (issuer_id != nullptr) {
-        *issuer_id = 0;
+        *issuer_id = std::strlen(g_dummy_auth_code);
     }
     return ORBIS_OK;
 }

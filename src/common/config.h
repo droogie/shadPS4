@@ -33,6 +33,12 @@ void load(const std::filesystem::path& path, bool is_game_specific = false);
 void save(const std::filesystem::path& path, bool is_game_specific = false);
 void resetGameSpecificValue(std::string entry);
 
+std::string GetHttpHostOverride();
+std::string GetStunServer();
+std::string GetNpServer();
+int GetSignalingPort();
+std::string GetSignalingAddr();
+
 bool getGameRunning();
 void setGameRunning(bool running);
 int getVolumeSlider();
