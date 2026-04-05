@@ -204,7 +204,9 @@ static std::atomic<int> s_deactivate_count{0};
 // --- Connection state machine implementation ---
 
 static void TransitionToActive(s32 conn_id);
-static s32 TickSignalingConnectionLocked(NpSignalingConnection& conn, s32 echo_event);
+struct KernelEchoState;
+static s32 TickSignalingConnectionLocked(NpSignalingConnection& conn, s32 echo_event,
+                                          const KernelEchoState& kern);
 
 // Transition a connection to ACTIVE (0xa) and fire callbacks.
 // Must be called WITHOUT s_sig_mutex held.
@@ -248,43 +250,46 @@ static void TransitionToActive(s32 conn_id) {
     NpMatching2::OnPeerEstablished(conn_id, 0);
 }
 
+// Pre-queried kernel state to avoid holding s_sig_mutex while calling kernel.
+struct KernelEchoState {
+    bool active = false;    // kernel conn ACTIVE (echo bilateral done)
+    u32 addr = 0;           // peer addr from kernel
+    u16 port = 0;           // peer port from kernel
+};
+
+static KernelEchoState QueryKernelEchoState(const std::string& npid) {
+    // Called OUTSIDE s_sig_mutex. Takes kernel.mutex_ briefly.
+    KernelEchoState result{};
+    auto& kernel = Libraries::Net::KernelP2PSubsystem::Instance();
+    s32 kern_cid = kernel.GetConnIdByNpid(npid);
+    if (kern_cid > 0) {
+        s32 kern_status = 0;
+        kernel.GetConnectionStatus(kern_cid, &kern_status, &result.addr, &result.port);
+        result.active = (kern_status == 2); // ACTIVE = echo bilateral done
+    }
+    return result;
+}
+
 // Tick a single connection's state machine (called with s_sig_mutex HELD).
 // Caller must release lock and call TransitionToActive outside if needed.
 // Returns conn_id to transition to ACTIVE, or 0 if no transition needed.
-static s32 TickSignalingConnectionLocked(NpSignalingConnection& conn, s32 echo_event) {
+// Pre-queried kernel state passed in to avoid deadlock with kernel.mutex_.
+static s32 TickSignalingConnectionLocked(NpSignalingConnection& conn, s32 echo_event,
+                                          const KernelEchoState& kern) {
     auto now = std::chrono::steady_clock::now();
-
-    // Check kernel echo status once (used by multiple states for catch-up)
-    bool kern_echo_active = false;
-    {
-        auto& kernel = Libraries::Net::KernelP2PSubsystem::Instance();
-        s32 kern_cid = kernel.GetConnIdByNpid(conn.npid);
-        if (kern_cid > 0) {
-            s32 kern_status = 0;
-            kernel.GetConnectionStatus(kern_cid, &kern_status, nullptr, nullptr);
-            kern_echo_active = (kern_status == 2); // ACTIVE = echo bilateral done
-        }
-    }
+    bool kern_echo_active = kern.active;
 
     switch (conn.state) {
     case SIG_STATE_PENDING:
         // State 1->3: peer addr known?
         if (conn.peer_addr == 0) {
-            // Fallback: query kernel which has addr from SetPeerInfo
-            auto& kernel = Libraries::Net::KernelP2PSubsystem::Instance();
-            s32 kern_cid = kernel.GetConnIdByNpid(conn.npid);
-            if (kern_cid > 0) {
-                u32 ka = 0;
-                u16 kp = 0;
-                s32 ks = 0;
-                kernel.GetConnectionStatus(kern_cid, &ks, &ka, &kp);
-                if (ka != 0) {
-                    conn.peer_addr = ka;
-                    conn.peer_port = kp;
-                    LOG_INFO(Lib_NpSignaling,
-                             "SigState: conn={} resolved peer_addr from kernel: {:#x}:{}",
-                             conn.conn_id, ka, ntohs(kp));
-                }
+            // Use pre-queried kernel addr (from SetPeerInfo)
+            if (kern.addr != 0) {
+                conn.peer_addr = kern.addr;
+                conn.peer_port = kern.port;
+                LOG_INFO(Lib_NpSignaling,
+                         "SigState: conn={} resolved peer_addr from kernel: {:#x}:{}",
+                         conn.conn_id, kern.addr, ntohs(kern.port));
             }
             if (conn.peer_addr == 0)
                 break;
@@ -390,13 +395,22 @@ static s32 TickSignalingConnectionLocked(NpSignalingConnection& conn, s32 echo_e
 
 // Public API: tick a connection by conn_id (called from KernelEventBridge)
 void TickConnection(s32 conn_id, s32 echo_event) {
+    // Pre-query kernel state OUTSIDE s_sig_mutex (avoid deadlock with kernel.mutex_)
+    std::string npid;
+    {
+        std::lock_guard lock(s_sig_mutex);
+        auto it = s_sig_connections.find(conn_id);
+        if (it == s_sig_connections.end()) return;
+        npid = it->second.npid;
+    }
+    auto kern = QueryKernelEchoState(npid);
+
     s32 activate_conn = 0;
     {
         std::lock_guard lock(s_sig_mutex);
         auto it = s_sig_connections.find(conn_id);
-        if (it == s_sig_connections.end())
-            return;
-        activate_conn = TickSignalingConnectionLocked(it->second, echo_event);
+        if (it == s_sig_connections.end()) return;
+        activate_conn = TickSignalingConnectionLocked(it->second, echo_event, kern);
     }
     // Fire TransitionToActive OUTSIDE the lock (callbacks may re-enter)
     if (activate_conn > 0) {
@@ -406,6 +420,9 @@ void TickConnection(s32 conn_id, s32 echo_event) {
 
 // Public API: set server_confirmed flag and tick
 void SetServerConfirmed(const std::string& npid) {
+    // Pre-query kernel state OUTSIDE s_sig_mutex
+    auto kern = QueryKernelEchoState(npid);
+
     s32 activate_conn = 0;
     {
         std::lock_guard lock(s_sig_mutex);
@@ -418,7 +435,7 @@ void SetServerConfirmed(const std::string& npid) {
                          "SetServerConfirmed: npid='{}' conn_id={} state={} -- "
                          "flags set, ticking",
                          npid, cid, conn.state);
-                activate_conn = TickSignalingConnectionLocked(conn, -1);
+                activate_conn = TickSignalingConnectionLocked(conn, -1, kern);
                 break;
             }
         }
@@ -482,59 +499,54 @@ static void KernelEventBridge(s32 ctx_id, s32 conn_id, s32 event, u32 delay_ms) 
         //
         // Find the NpSignaling conn_id that matches this kernel conn_id.
         // The kernel conn_id may differ from our s_sig_connections key.
+        //
+        // Step 1: Query kernel for npid OUTSIDE s_sig_mutex (avoid deadlock --
+        // signaling thread holds kernel.mutex_ -> calls KernelEventBridge -> wants s_sig_mutex).
+        std::string event_npid =
+            Libraries::Net::KernelP2PSubsystem::Instance().GetNpidForConn(conn_id);
+
+        // Step 2: Find matching sig connection by conn_id or npid
         s32 sig_conn_id = 0;
         {
             std::lock_guard lock(s_sig_mutex);
-            // Map kernel conn_id -> NpSignaling conn_id via npid.
             auto it = s_sig_connections.find(conn_id);
             if (it != s_sig_connections.end()) {
                 sig_conn_id = conn_id;
-            } else {
-                // Look up npid from kernel, find matching NpSignaling connection
-                auto& kernel = Libraries::Net::KernelP2PSubsystem::Instance();
-                u16 member_id = kernel.GetMemberIdForConn(conn_id);
-                std::string npid;
-                LOG_INFO(Lib_NpSignaling,
-                         "KernelEventBridge: npid lookup -- kernel conn_id={} member_id={} "
-                         "sig_connections_size={}",
-                         conn_id, member_id, s_sig_connections.size());
-                if (member_id > 0) {
-                    for (auto& [cid, conn] : s_sig_connections) {
-                        s32 kern_cid = kernel.GetConnIdByNpid(conn.npid);
-                        LOG_INFO(Lib_NpSignaling,
-                                 "KernelEventBridge: checking sig conn={} npid='{}' "
-                                 "state={} kern_cid_for_npid={} vs event_conn={}",
-                                 cid, conn.npid, conn.state, kern_cid, conn_id);
-                        if (kern_cid == conn_id) {
-                            sig_conn_id = cid;
-                            // Reset stale non-ACTIVE sig connections -- kernel
-                            // bilateral already confirmed connectivity
-                            if (conn.state != SIG_STATE_ACTIVE && (event == 1 || event == 0xc)) {
-                                conn.state = SIG_STATE_PENDING;
-                                conn.state_start = std::chrono::steady_clock::now();
-                                conn.has_peer_info = true;
-                                conn.bilateral_confirmed = true;
-                                conn.stun_completed = true;
-                                conn.server_confirmed = true;
-                                LOG_INFO(Lib_NpSignaling,
-                                         "KernelEventBridge: reset stale sig conn={} "
-                                         "npid='{}' for ESTABLISHED delivery",
-                                         cid, conn.npid);
-                            }
-                            break;
+            } else if (!event_npid.empty()) {
+                // Match by npid -- kernel conn_id and sig conn_id diverged
+                for (auto& [cid, conn] : s_sig_connections) {
+                    if (conn.npid == event_npid) {
+                        sig_conn_id = cid;
+                        // Reset stale non-ACTIVE connections so the state machine
+                        // can process ESTABLISHED
+                        if (conn.state != SIG_STATE_ACTIVE) {
+                            conn.state = SIG_STATE_PENDING;
+                            conn.state_start = std::chrono::steady_clock::now();
+                            conn.has_peer_info = true;
+                            conn.bilateral_confirmed = true;
+                            conn.stun_completed = true;
+                            conn.server_confirmed = true;
+                            LOG_INFO(Lib_NpSignaling,
+                                     "KernelEventBridge: reset stale sig conn={} "
+                                     "npid='{}' state->PENDING for ESTABLISHED delivery",
+                                     cid, event_npid);
                         }
+                        break;
                     }
                 }
-                if (sig_conn_id == 0) {
-                    LOG_WARNING(Lib_NpSignaling,
-                                "KernelEventBridge: no sig connection for kernel conn_id={} "
-                                "(member={})",
-                                conn_id, member_id);
-                    return;
-                }
+            }
+            if (sig_conn_id == 0) {
+                LOG_WARNING(Lib_NpSignaling,
+                            "KernelEventBridge: no sig connection for kernel conn_id={} "
+                            "npid='{}'",
+                            conn_id, event_npid);
+                return;
+            }
+            if (sig_conn_id != conn_id) {
                 LOG_INFO(Lib_NpSignaling,
-                         "KernelEventBridge: mapped kernel conn_id={} -> sig conn_id={}", conn_id,
-                         sig_conn_id);
+                         "KernelEventBridge: mapped kernel conn_id={} -> sig conn_id={} "
+                         "via npid='{}'",
+                         conn_id, sig_conn_id, event_npid);
             }
         }
         TickConnection(sig_conn_id, event);
