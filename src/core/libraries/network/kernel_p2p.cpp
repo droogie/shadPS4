@@ -527,6 +527,17 @@ int KernelP2PSubsystem::GetConnectionInfo(s32 conn_id, s32 info_type, void* info
     return 0;
 }
 
+int KernelP2PSubsystem::GetActivePeerCount() const {
+    std::lock_guard lock(mutex_);
+    int count = 0;
+    for (const auto& [mid, pi] : peers_) {
+        if (pi.addr != 0 && !(pi.addr == local_addr_ && pi.port == local_port_)) {
+            count++;
+        }
+    }
+    return count;
+}
+
 bool KernelP2PSubsystem::GetActivePeerAddr(u32* addr_out, u16* port_out) {
     std::lock_guard lock(mutex_);
 
@@ -1122,17 +1133,23 @@ void KernelP2PSubsystem::SignalingThreadFunc() {
             continue;
         }
 
-        // 1. Process pending STUN OFFERs from the queue (synchronous)
+        // 1. Process at most ONE pending STUN OFFER per tick.
+        // Processing all offers sequentially blocks echo probes for 500ms+ per peer,
+        // causing compounding delays with 2+ peers. One-per-tick interleaves STUN
+        // negotiation with echo probes so all peers make progress concurrently.
         int offers_processed = 0;
         {
-            std::deque<PendingOffer> offers;
+            PendingOffer offer{};
+            bool has_offer = false;
             {
                 std::lock_guard lock(offer_queue_mutex_);
-                offers.swap(offer_queue_);
+                if (!offer_queue_.empty()) {
+                    offer = std::move(offer_queue_.front());
+                    offer_queue_.pop_front();
+                    has_offer = true;
+                }
             }
-            for (const auto& offer : offers) {
-                if (signaling_shutdown_.load())
-                    break;
+            if (has_offer && !signaling_shutdown_.load()) {
                 LOG_INFO(Lib_Net, "KernelP2P: sigloop tick={} processing STUN OFFER for conn_id={}",
                          sig_loop_tick, offer.conn_id);
                 ProcessStunOffer(offer.ctx_id, offer.conn_id, offer.peer_addr, offer.peer_port,
@@ -1429,33 +1446,40 @@ void KernelP2PSubsystem::SendEchoProbes() {
     std::vector<DeferredFire> data_phase_done;
     std::vector<DeferredFire> unreachable_dead;
 
+    // Diagnostic snapshot — captured under lock, logged outside to reduce hold time.
+    struct ConnDiag {
+        s32 cid; std::string npid; u32 addr; u16 port;
+        int state; int stun; bool echo_started; bool game_activated;
+        bool events_fired; bool echo_bilateral; int probes_sent; int resp; long ms_since_echo;
+    };
+    std::vector<ConnDiag> diag_snapshot;
+    int diag_tick = 0;
+    size_t diag_conn_count = 0;
+    int diag_fd = -1;
+    bool should_log = false;
+
     {
         std::lock_guard lock(mutex_);
         static int echo_tick = 0;
         echo_tick++;
-        // Log every tick for first 20, then every 50th
-        bool should_log = (echo_tick <= 20 || echo_tick % 50 == 0);
+        diag_tick = echo_tick;
+        should_log = (echo_tick <= 20 || echo_tick % 50 == 0);
         if (should_log) {
-            LOG_INFO(Lib_Net, "KernelP2P: SendEchoProbes tick={} connections={} fd={}", echo_tick,
-                     connections_.size(), [&] {
-                         auto* s = stun_client_.load();
-                         return s ? s->GetSocketFd() : -1;
-                     }());
+            diag_conn_count = connections_.size();
+            auto* s = stun_client_.load();
+            diag_fd = s ? s->GetSocketFd() : -1;
             for (const auto& [cid, conn] : connections_) {
                 auto ms_since_echo =
                     conn.last_echo_sent != std::chrono::steady_clock::time_point{}
                         ? std::chrono::duration_cast<std::chrono::milliseconds>(
                               std::chrono::steady_clock::now() - conn.last_echo_sent)
                               .count()
-                        : -1;
-                LOG_INFO(Lib_Net,
-                         "  conn_id={} npid='{}' addr={:#x}:{} state={} stun={} "
-                         "echo_started={} game_activated={} events_fired={} "
-                         "echo_bilateral={} probes_sent={} resp={} ms_since_echo={}",
-                         cid, conn.npid, conn.addr, ntohs(conn.port), static_cast<int>(conn.state),
-                         static_cast<int>(conn.stun_state), conn.echo_started, conn.game_activated,
-                         conn.events_fired, conn.echo_bilateral, conn.echo_probes_sent,
-                         conn.echo_responses_received, ms_since_echo);
+                        : -1L;
+                diag_snapshot.push_back({cid, conn.npid, conn.addr, conn.port,
+                    static_cast<int>(conn.state), static_cast<int>(conn.stun_state),
+                    conn.echo_started, conn.game_activated, conn.events_fired,
+                    conn.echo_bilateral, conn.echo_probes_sent,
+                    conn.echo_responses_received, ms_since_echo});
             }
         }
         for (auto& [cid, conn] : connections_) {
@@ -1555,6 +1579,22 @@ void KernelP2PSubsystem::SendEchoProbes() {
             u16 target_port = conn.mapped_port ? conn.mapped_port : conn.port;
             targets.push_back(
                 {cid, conn.ctx_id, target_addr, target_port, conn.npid, conn.events_fired});
+        }
+    }
+
+    // Deferred diagnostic logging outside lock (avoids holding mutex_ during I/O).
+    if (should_log) {
+        LOG_INFO(Lib_Net, "KernelP2P: SendEchoProbes tick={} connections={} fd={}", diag_tick,
+                 diag_conn_count, diag_fd);
+        for (const auto& d : diag_snapshot) {
+            LOG_INFO(Lib_Net,
+                     "  conn_id={} npid='{}' addr={:#x}:{} state={} stun={} "
+                     "echo_started={} game_activated={} events_fired={} "
+                     "echo_bilateral={} probes_sent={} resp={} ms_since_echo={}",
+                     d.cid, d.npid, d.addr, ntohs(d.port), d.state,
+                     d.stun, d.echo_started, d.game_activated,
+                     d.events_fired, d.echo_bilateral, d.probes_sent,
+                     d.resp, d.ms_since_echo);
         }
     }
 
@@ -1753,26 +1793,15 @@ void KernelP2PSubsystem::ProcessEchoProbe(u32 from_addr, u16 from_port, const u8
                             conn.echo_bilateral = true;
                             conn.state = ConnState::ACTIVE;
 
-                            // Delay ESTABLISHED for GUEST late-joiners so the game
+                            // Delay ESTABLISHED for all GUEST connections so the game
                             // has time to create SocketState entries. HOST always fires
                             // immediately (needs to send TYPE=1 sessionReady promptly).
-                            // STUN: always delay on GUEST side.
-                            // LAN: delay only when there are already established peers.
+                            // Uniform delay for all GUEST peers prevents asymmetric timing
+                            // where peer1 gets 0ms delay but peer2 gets 2000ms (which caused
+                            // multi-peer summoning to get stuck).
                             bool should_delay = false;
                             if (DATA_EXCHANGE_DURATION.count() > 0 && my_member_id_ != 1) {
-                                if (conn.stun_state != StunState::NONE) {
-                                    // STUN connections: always delay for GUEST
-                                    should_delay = true;
-                                } else {
-                                    // LAN: delay only for late-joiners (existing peers)
-                                    for (const auto& [other_cid, other] : connections_) {
-                                        if (other_cid != cid && other.events_fired &&
-                                            other.state == ConnState::ACTIVE) {
-                                            should_delay = true;
-                                            break;
-                                        }
-                                    }
-                                }
+                                should_delay = true;
                             }
 
                             if (should_delay) {
@@ -1930,9 +1959,10 @@ void KernelP2PSubsystem::ProcessStunOffer(s32 ctx_id, s32 conn_id, u32 peer_addr
                  "waiting for ACCEPT (2s timeout)",
                  mapped_buf, ntohs(result.mapped_port));
 
-        // Short timeout -- the signaling thread's main loop will catch the
-        // ACCEPT as an incoming relay if we miss it here.
-        auto accept = sc_offer->WaitForRelay(500);
+        // Short timeout -- reduced from 500ms to 100ms to avoid blocking the
+        // signaling thread when multiple peers activate concurrently. The main
+        // loop's WaitForRelay catches late ACCEPTs on subsequent ticks.
+        auto accept = sc_offer->WaitForRelay(100);
 
         // Update connection state under lock, then send NAT punch outside lock
         // (sendto + sleep_for while holding mutex_ starves other threads for ~100ms).

@@ -311,7 +311,7 @@ struct NpMatching2State {
     std::atomic<bool> host_poll_running{false};
     Kernel::PthreadT host_poll_thread = nullptr;
     int known_member_count = 0;               // members the host already knows about
-    bool host_self_established_fired = false; // guard: only fire self Established (0x5102) once
+    std::atomic<bool> host_self_established_fired{false}; // guard: only fire self Established (0x5102) once
 
     // Guest-side member polling thread (Phase 2: departure detection)
     std::atomic<bool> guest_poll_running{false};
@@ -369,7 +369,7 @@ struct NpMatching2State {
         guest_poll_running = false;
         dispatch_running = false;
         np_events_cursor = 0;
-        host_self_established_fired = false;
+        host_self_established_fired.store(false);
 
         // Close WebSocket to unblock poll thread's ws_client->poll() call,
         // but do NOT reset/destroy it yet -- threads may still be referencing it.
@@ -495,6 +495,30 @@ void DrainReadyEvents() {
                                 "event={:#x} reqId={} (ready.size={})",
                                 rit->req_event, rit->req_id, ready.size());
                     continue; // skip this duplicate
+                }
+            }
+            if (wit != rit)
+                *wit = std::move(*rit);
+            ++wit;
+        }
+        ready.erase(wit, ready.end());
+    }
+
+    // Deduplicate SIGNALING_CB events: only keep the first per member_id+sig_event.
+    // Prevents duplicate ESTABLISHED from confusing the game's connection state machine
+    // when multiple poll threads schedule events for the same member concurrently.
+    {
+        std::set<u64> seen_sig;
+        auto wit = ready.begin();
+        for (auto rit = ready.begin(); rit != ready.end(); ++rit) {
+            if (rit->type == PendingEvent::SIGNALING_CB) {
+                u64 key = (static_cast<u64>(rit->member_id) << 16) | rit->sig_event;
+                if (!seen_sig.insert(key).second) {
+                    LOG_WARNING(Lib_NpMatching2,
+                                "EventDispatch: removing duplicate SIGNALING_CB "
+                                "event={:#x} member={} (ready.size={})",
+                                rit->sig_event, rit->member_id, ready.size());
+                    continue;
                 }
             }
             if (wit != rit)
@@ -656,7 +680,7 @@ void OnPeerEstablished(s32 conn_id, u16 member_id) {
     if (member_id == 0 || member_id == g_state.ctx.my_member_id) {
         return;
     }
-    if (!g_state.host_self_established_fired) {
+    if (!g_state.host_self_established_fired.load()) {
         return;
     }
 
@@ -1210,7 +1234,7 @@ static void HandlePollEvent(const std::string& resp) {
                 g_state.ctx.session_id.clear();
                 NpSignaling::ClearConnections();
                 g_state.known_member_count = 0;
-                g_state.host_self_established_fired = false;
+                g_state.host_self_established_fired.store(false);
                 {
                     std::lock_guard<std::mutex> inv_lock(g_state.pending_guest_invite_mutex);
                     g_state.pending_guest_invite = {};
@@ -1237,7 +1261,7 @@ static void HandlePollEvent(const std::string& resp) {
             LOG_WARNING(Lib_NpMatching2, "invite poll: signaling_event sig={:#x} member={} conn={}",
                         sig_event, sig_member, sig_conn);
             if (sig_member > 0 && sig_member != g_state.ctx.my_member_id &&
-                g_state.host_self_established_fired) {
+                g_state.host_self_established_fired.load()) {
                 // Update peer status in the peers map.
                 {
                     std::lock_guard<std::mutex> plock(g_state.peers_mutex);
@@ -1346,7 +1370,7 @@ static void HandlePollEvent(const std::string& resp) {
                 g_state.peers.clear();
             }
             g_state.guest_poll_running = false;
-            g_state.host_self_established_fired = false;
+            g_state.host_self_established_fired.store(false);
             NpSignaling::ClearConnections();
             Libraries::Net::ClearP2PSessionState();
         }
@@ -2081,7 +2105,7 @@ static bool HandleHostPeerJoinedEvent(const MemberInfo& member, const char* sour
     // For subsequent peer joins (after initial session setup), activate the P2P
     // connection immediately. For the initial join, the connection pipeline drives
     // activation naturally via the JoinRoom callback flow.
-    const bool session_established = g_state.host_self_established_fired;
+    const bool session_established = g_state.host_self_established_fired.load();
 
     // Start echo probes for NAT punch-through when appropriate.
     if (g_state.ctx.my_member_id == 1 || session_established) {
@@ -2092,7 +2116,9 @@ static bool HandleHostPeerJoinedEvent(const MemberInfo& member, const char* sour
     ScheduleRoomEventMemberJoined(member, now);
 
     // Fire self Established (0x5102) once on first peer join.
-    if (!g_state.host_self_established_fired) {
+    // Atomic CAS prevents duplicate events when multiple poll threads race here.
+    bool expected_false = false;
+    if (g_state.host_self_established_fired.compare_exchange_strong(expected_false, true)) {
         PendingEvent sig_ev{};
         sig_ev.type = PendingEvent::SIGNALING_CB;
         sig_ev.fire_at = now + std::chrono::milliseconds(200);
@@ -2101,7 +2127,6 @@ static bool HandleHostPeerJoinedEvent(const MemberInfo& member, const char* sour
         sig_ev.sig_event = ORBIS_NP_MATCHING2_SIGNALING_EVENT_ESTABLISHED;
         sig_ev.conn_id = static_cast<u32>(g_state.ctx.my_member_id);
         ScheduleEvent(std::move(sig_ev));
-        g_state.host_self_established_fired = true;
         NP_LOG("HandleHostPeerJoinedEvent: fired FIRST self Established 0x5102 (member={})",
                g_state.ctx.my_member_id);
     } else {
@@ -2543,7 +2568,7 @@ static PS4_SYSV_ABI void* CreateJoinRoomThreadFunc(void* arg) {
     // Optional poll fallback can be enabled for diagnostics/compat:
     //   SHADPS4_M2_HOST_POLL_FALLBACK=1
     g_state.known_member_count = 1;              // host only
-    g_state.host_self_established_fired = false; // reset for new session
+    g_state.host_self_established_fired.store(false); // reset for new session
     if (HostPollFallbackEnabled() && !g_state.host_poll_running) {
         g_state.host_poll_running = true;
         Kernel::PthreadT poll_thread = nullptr;
@@ -2969,7 +2994,7 @@ static PS4_SYSV_ABI void* JoinRoomThreadFunc(void* arg) {
         }
 
         // Mark self Established as fired so HandleHostPeerJoinedEvent won't re-fire.
-        g_state.host_self_established_fired = true;
+        g_state.host_self_established_fired.store(true);
 
         // Dead (0x5101) events are not fired here; the native pipeline handles
         // connection advancement through the signaling state machine.
@@ -3174,7 +3199,7 @@ s32 PS4_SYSV_ABI sceNpMatching2LeaveRoom(u16 ctxId, void* reqParam, void* optPar
     NpSignaling::ClearConnections();
     Libraries::Net::ClearP2PSessionState();
     g_state.known_member_count = 0;
-    g_state.host_self_established_fired = false;
+    g_state.host_self_established_fired.store(false);
 
     // Fire request callback event 0x103 immediately.
     if (callback) {

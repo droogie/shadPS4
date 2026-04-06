@@ -725,6 +725,13 @@ int P2PSocket::SendPacket(const void* msg, u32 len, int flags, const OrbisNetSoc
     //    (this is the key fix -- the game may provide a wrong port from signaling data)
     OrbisNetSockaddrIn resolved_to = *orbis_to;
     if (orbis_to->sin_addr == 0 && orbis_to->sin_port == 0) {
+        int peer_count = KernelP2PSubsystem::Instance().GetActivePeerCount();
+        if (peer_count > 1) {
+            LOG_WARNING(Lib_Net,
+                        "P2P sendto: game sent to 0.0.0.0:0 with {} active peers -- "
+                        "GetActivePeerAddr returns first match only, may misroute!",
+                        peer_count);
+        }
         u32 peer_addr = 0;
         u16 peer_port = 0;
         if (KernelP2PSubsystem::Instance().GetActivePeerAddr(&peer_addr, &peer_port)) {

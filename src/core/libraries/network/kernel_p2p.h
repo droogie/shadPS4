@@ -84,8 +84,13 @@ public:
     // Get connection info by type (RTT, bandwidth, peer NpId, peer addr, etc.)
     int GetConnectionInfo(s32 conn_id, s32 info_type, void* info);
 
+    // Count of active remote peers (non-local, non-zero address).
+    // Used to detect multi-peer sessions for routing decisions.
+    int GetActivePeerCount() const;
+
     // Get any active remote peer (for P2P address resolution when game sends to 0.0.0.0:0).
     // Skips the local address to find the REMOTE peer.
+    // WARNING: Returns first match only — unreliable with 2+ peers.
     bool GetActivePeerAddr(u32* addr_out, u16* port_out);
 
     // Resolve a peer's P2P port by address from the tunnel table.
