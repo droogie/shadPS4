@@ -2134,29 +2134,16 @@ static bool HandleHostPeerJoinedEvent(const MemberInfo& member, const char* sour
                g_state.ctx.my_member_id);
     }
 
-    // For subsequent peers (session already established), fire 0x5102 immediately.
-    // For the initial peer join, defer until signaling is confirmed by the server.
-    if (session_established) {
-        PendingEvent peer_ev{};
-        peer_ev.type = PendingEvent::SIGNALING_CB;
-        peer_ev.fire_at = now + std::chrono::milliseconds(200);
-        peer_ev.room_id = g_state.ctx.room_id;
-        peer_ev.member_id = peer_mid;
-        peer_ev.sig_event = ORBIS_NP_MATCHING2_SIGNALING_EVENT_ESTABLISHED;
-        peer_ev.conn_id = static_cast<u32>(peer_mid);
-        ScheduleEvent(std::move(peer_ev));
-
-        NP_LOG("HandleHostPeerJoinedEvent: fired peer 0x5102 for member={} "
-               "(session_established, immediate)",
-               peer_mid);
-    } else {
-        // Initial join: defer 0x5102 until signaling is confirmed active.
-        // Pre-create the signaling connection so events can be delivered.
-        NpSignaling::EnsureSigConnection(g_state.ctx.ctx_id, member.online_id);
-        NP_LOG("HandleHostPeerJoinedEvent: peer 0x5102 for member={} DEFERRED "
-               "to OnPeerEstablished (initial join)",
-               peer_mid);
-    }
+    // Always defer peer 0x5102 to OnPeerEstablished — only fire after echo
+    // bilateral confirms actual P2P connectivity. Firing eagerly creates a
+    // ConnObj that polls GetConnectionStatus; if the peer is unreachable
+    // (STUN failure, private IP, NAT issue), the ConnObj stays stuck forever
+    // and blocks the SO's checkAllConnObjsReady, preventing ALL future
+    // connections until the stuck peer disconnects.
+    NpSignaling::EnsureSigConnection(g_state.ctx.ctx_id, member.online_id);
+    NP_LOG("HandleHostPeerJoinedEvent: peer 0x5102 for member={} DEFERRED "
+           "to OnPeerEstablished (connectivity-gated)",
+           peer_mid);
 
     {
         std::lock_guard<std::mutex> plock(g_state.peers_mutex);
