@@ -1450,7 +1450,7 @@ void KernelP2PSubsystem::SendEchoProbes() {
     struct ConnDiag {
         s32 cid; std::string npid; u32 addr; u16 port;
         int state; int stun; bool echo_started; bool game_activated;
-        bool events_fired; bool echo_bilateral; int probes_sent; int resp; long ms_since_echo;
+        bool events_fired; bool echo_bilateral; int probes_sent; int resp; long long ms_since_echo;
     };
     std::vector<ConnDiag> diag_snapshot;
     int diag_tick = 0;
@@ -1474,7 +1474,7 @@ void KernelP2PSubsystem::SendEchoProbes() {
                         ? std::chrono::duration_cast<std::chrono::milliseconds>(
                               std::chrono::steady_clock::now() - conn.last_echo_sent)
                               .count()
-                        : -1L;
+                        : -1LL;
                 diag_snapshot.push_back({cid, conn.npid, conn.addr, conn.port,
                     static_cast<int>(conn.state), static_cast<int>(conn.stun_state),
                     conn.echo_started, conn.game_activated, conn.events_fired,
