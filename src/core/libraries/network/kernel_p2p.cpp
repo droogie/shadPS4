@@ -681,17 +681,15 @@ void KernelP2PSubsystem::SetPeerInfo(u16 member_id, u32 addr, u16 port, const st
                     conn.port = port;
 
                     // Determine if STUN exchange should gate ESTABLISHED events.
+                    // Always attempt STUN for non-self peers when a STUN client is
+                    // available. Private (RFC 1918) addresses do NOT imply same-LAN
+                    // reachability — cross-network peers may report their LAN IP if
+                    // their client hasn't completed NAT probing. Echo probes run in
+                    // parallel with STUN, so LAN peers still get the fast path
+                    // (direct echo bilateral confirms before STUN finishes).
                     auto* sc_spi = stun_client_.load();
                     bool stun_usable = (sc_spi != nullptr && sc_spi->GetMappedAddr() != 0);
-                    bool peer_is_private = false;
-                    {
-                        u32 a = ntohl(addr);
-                        peer_is_private = ((a >> 24) == 10) ||     // 10.0.0.0/8
-                                          ((a >> 20) == 0xAC1) ||  // 172.16.0.0/12
-                                          ((a >> 16) == 0xC0A8) || // 192.168.0.0/16
-                                          ((a >> 24) == 127);      // 127.0.0.0/8
-                    }
-                    bool needs_stun = (stun_usable && !is_self && !peer_is_private);
+                    bool needs_stun = (stun_usable && !is_self);
 
                     if (needs_stun && (my_member_id_ == 1 || member_id == 1)) {
                         // HOST<->GUEST STUN exchange: gate ESTABLISHED until
@@ -916,6 +914,7 @@ void KernelP2PSubsystem::Reset() {
     current_room_id_ = 0;
     my_member_id_ = 0;
     gate_enabled_ = false;
+    nat_probe_succeeded_.store(false);
     local_npid_.clear();
     stun_client_.store(nullptr);
     peer_classifications_.clear();
@@ -1103,9 +1102,10 @@ void KernelP2PSubsystem::SignalingThreadFunc() {
                          ntohs(probe.mapped_port), static_cast<int>(probe.nat_type));
                 Libraries::Np::NpMatching2::UpdateSignalingAddrFromStun(std::string(buf),
                                                                         ntohs(probe.mapped_port));
+                nat_probe_succeeded_.store(true);
             } else {
                 LOG_WARNING(Lib_Net, "KernelP2P: NAT probe failed -- STUN server unreachable, "
-                                     "LAN mode will be used");
+                                     "will retry periodically");
             }
             nat_probe_done.store(true);
         });
@@ -1133,23 +1133,17 @@ void KernelP2PSubsystem::SignalingThreadFunc() {
             continue;
         }
 
-        // 1. Process at most ONE pending STUN OFFER per tick.
-        // Processing all offers sequentially blocks echo probes for 500ms+ per peer,
-        // causing compounding delays with 2+ peers. One-per-tick interleaves STUN
-        // negotiation with echo probes so all peers make progress concurrently.
+        // 1. Process pending STUN OFFERs from the queue (synchronous)
         int offers_processed = 0;
         {
-            PendingOffer offer{};
-            bool has_offer = false;
+            std::deque<PendingOffer> offers;
             {
                 std::lock_guard lock(offer_queue_mutex_);
-                if (!offer_queue_.empty()) {
-                    offer = std::move(offer_queue_.front());
-                    offer_queue_.pop_front();
-                    has_offer = true;
-                }
+                offers.swap(offer_queue_);
             }
-            if (has_offer && !signaling_shutdown_.load()) {
+            for (const auto& offer : offers) {
+                if (signaling_shutdown_.load())
+                    break;
                 LOG_INFO(Lib_Net, "KernelP2P: sigloop tick={} processing STUN OFFER for conn_id={}",
                          sig_loop_tick, offer.conn_id);
                 ProcessStunOffer(offer.ctx_id, offer.conn_id, offer.peer_addr, offer.peer_port,
@@ -1163,6 +1157,32 @@ void KernelP2PSubsystem::SignalingThreadFunc() {
         if (now - last_keepalive >= KEEPALIVE_INTERVAL) {
             last_keepalive = now;
             sc->SendKeepalive();
+        }
+
+        // 2b. Retry NAT probe if it hasn't succeeded yet.
+        // The initial probe can fail if the STUN server is temporarily unreachable
+        // (e.g., DNS resolution timing, transient network issue). Without this,
+        // the client is stuck on its LAN IP forever and remote peers can't reach it.
+        static constexpr auto NAT_RETRY_INTERVAL = std::chrono::seconds(10);
+        static auto last_nat_retry = std::chrono::steady_clock::time_point{};
+        if (!nat_probe_succeeded_.load() && nat_probe_done.load() &&
+            (now - last_nat_retry >= NAT_RETRY_INTERVAL)) {
+            last_nat_retry = now;
+            LOG_INFO(Lib_Net, "KernelP2P: retrying NAT probe (previous attempt failed)");
+            auto probe = sc->NatProbe();
+            if (probe.success) {
+                char buf[INET_ADDRSTRLEN];
+                inet_ntop(AF_INET, &probe.mapped_addr, buf, sizeof(buf));
+                LOG_INFO(Lib_Net, "KernelP2P: NAT probe retry succeeded: mapped={}:{}", buf,
+                         ntohs(probe.mapped_port));
+                Libraries::Np::NpMatching2::UpdateSignalingAddrFromStun(std::string(buf),
+                                                                        ntohs(probe.mapped_port));
+                nat_probe_succeeded_.store(true);
+            } else {
+                LOG_WARNING(Lib_Net,
+                            "KernelP2P: NAT probe retry failed -- will try again in {}s",
+                            NAT_RETRY_INTERVAL.count());
+            }
         }
 
         // 3. Process incoming STUN relays (OFFER from peer)
@@ -1793,15 +1813,26 @@ void KernelP2PSubsystem::ProcessEchoProbe(u32 from_addr, u16 from_port, const u8
                             conn.echo_bilateral = true;
                             conn.state = ConnState::ACTIVE;
 
-                            // Delay ESTABLISHED for all GUEST connections so the game
+                            // Delay ESTABLISHED for GUEST late-joiners so the game
                             // has time to create SocketState entries. HOST always fires
                             // immediately (needs to send TYPE=1 sessionReady promptly).
-                            // Uniform delay for all GUEST peers prevents asymmetric timing
-                            // where peer1 gets 0ms delay but peer2 gets 2000ms (which caused
-                            // multi-peer summoning to get stuck).
+                            // STUN: always delay on GUEST side.
+                            // LAN: delay only when there are already established peers.
                             bool should_delay = false;
                             if (DATA_EXCHANGE_DURATION.count() > 0 && my_member_id_ != 1) {
-                                should_delay = true;
+                                if (conn.stun_state != StunState::NONE) {
+                                    // STUN connections: always delay for GUEST
+                                    should_delay = true;
+                                } else {
+                                    // LAN: delay only for late-joiners (existing peers)
+                                    for (const auto& [other_cid, other] : connections_) {
+                                        if (other_cid != cid && other.events_fired &&
+                                            other.state == ConnState::ACTIVE) {
+                                            should_delay = true;
+                                            break;
+                                        }
+                                    }
+                                }
                             }
 
                             if (should_delay) {
@@ -1959,10 +1990,9 @@ void KernelP2PSubsystem::ProcessStunOffer(s32 ctx_id, s32 conn_id, u32 peer_addr
                  "waiting for ACCEPT (2s timeout)",
                  mapped_buf, ntohs(result.mapped_port));
 
-        // Short timeout -- reduced from 500ms to 100ms to avoid blocking the
-        // signaling thread when multiple peers activate concurrently. The main
-        // loop's WaitForRelay catches late ACCEPTs on subsequent ticks.
-        auto accept = sc_offer->WaitForRelay(100);
+        // Short timeout -- the signaling thread's main loop will catch the
+        // ACCEPT as an incoming relay if we miss it here.
+        auto accept = sc_offer->WaitForRelay(500);
 
         // Update connection state under lock, then send NAT punch outside lock
         // (sendto + sleep_for while holding mutex_ starves other threads for ~100ms).

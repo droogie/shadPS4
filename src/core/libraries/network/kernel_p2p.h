@@ -338,6 +338,7 @@ private:
     std::atomic<StunClient*> stun_client_{nullptr};
     std::thread signaling_thread_;
     std::atomic<bool> signaling_shutdown_{false};
+    std::atomic<bool> nat_probe_succeeded_{false};
 
     // Signaling thread main function.
     // Phase A: NAT probe (blocking, one-shot)
