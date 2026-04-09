@@ -1544,7 +1544,14 @@ void KernelP2PSubsystem::SendEchoProbes() {
             // With port-based relay (--relay), all peers connect through relay
             // server virtual ports -- echo probes succeed naturally via the relay.
             // This fallback only matters for STUN-only mode where direct P2P fails.
+            // Echo fallback with retry: mesh peers (GUEST<->GUEST) may not be
+            // online simultaneously. The first peer starts echo probes before
+            // the second has finished JoinRoom. Instead of permanently dying
+            // after one timeout, retry echo probes up to MAX_ECHO_RETRIES times.
+            // This gives late-joining mesh peers time to come online (~35s total
+            // with 3 retries at 3.5s each + the initial attempt).
             static constexpr auto STUN_FALLBACK_DELAY = std::chrono::milliseconds(3500);
+            static constexpr int MAX_ECHO_RETRIES = 3;
             if (conn.echo_started && !conn.events_fired && !conn.echo_bilateral &&
                 !conn.data_phase_active && conn.game_activated) {
                 if (conn.echo_start_at == std::chrono::steady_clock::time_point{}) {
@@ -1566,8 +1573,25 @@ void KernelP2PSubsystem::SendEchoProbes() {
                                      now - conn.echo_start_at)
                                      .count(),
                                  conn.echo_probes_sent, conn.echo_responses_received);
+                    } else if (conn.echo_retries < MAX_ECHO_RETRIES) {
+                        // Zero responses but retries remaining -- reset echo state
+                        // and try again. Mesh peers may not be online yet (concurrent
+                        // JoinRoom in flight). Retrying avoids permanently killing a
+                        // connection that would work a few seconds later.
+                        conn.echo_retries++;
+                        conn.echo_probes_sent = 0;
+                        conn.echo_responses_received = 0;
+                        conn.echo_start_at = now;
+                        conn.last_echo_sent = {};
+                        LOG_WARNING(Lib_Net,
+                                    "KernelP2P: peer UNREACHABLE -- conn_id={} npid='{}' "
+                                    "after {}ms, 0 responses (retry {}/{}) -- "
+                                    "resetting echo probes",
+                                    cid, conn.npid,
+                                    STUN_FALLBACK_DELAY.count(),
+                                    conn.echo_retries, MAX_ECHO_RETRIES);
                     } else {
-                        // Zero responses -- peer unreachable, fire DEAD
+                        // Exhausted retries -- peer genuinely unreachable, fire DEAD
                         conn.state = ConnState::INACTIVE;
                         conn.echo_started = false;
                         conn.events_fired = false;

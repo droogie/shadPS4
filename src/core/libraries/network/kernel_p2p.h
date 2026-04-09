@@ -278,6 +278,7 @@ private:
         bool echo_started{false};       // probes are being sent
         int echo_probes_sent{0};        // total probes sent
         int echo_responses_received{0}; // responses from peer
+        int echo_retries{0};            // unreachable retry count (mesh peers may join late)
         bool echo_bilateral{false};     // bilateral confirmation achieved
         std::chrono::steady_clock::time_point last_echo_sent{};
         std::chrono::steady_clock::time_point echo_start_at{}; // when to actually begin probing
