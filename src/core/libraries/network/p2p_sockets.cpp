@@ -556,6 +556,16 @@ static bool EnsureTransport() {
     ::setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, reinterpret_cast<const char*>(&one), sizeof(one));
 #endif
 
+    // Increase UDP receive buffer to 2MB. In relay mode, ALL peer traffic
+    // (game data, echo probes, STUN) shares this single socket. The OS default
+    // (~208KB Linux, ~64KB Windows) overflows once game data is flowing with
+    // the first peer, silently dropping echo probes from subsequent peers.
+    // This causes the "first peer works, others stuck" pattern.
+    int rcvbuf = 2 * 1024 * 1024;
+    ::setsockopt(fd, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&rcvbuf), sizeof(rcvbuf));
+    int sndbuf = 2 * 1024 * 1024;
+    ::setsockopt(fd, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char*>(&sndbuf), sizeof(sndbuf));
+
     u16 sig_port = GetSignalingPort();
     sockaddr_in bind_addr{};
     bind_addr.sin_family = AF_INET;

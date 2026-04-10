@@ -121,7 +121,17 @@ s32 KernelP2PSubsystem::ActivatePeer(s32 ctx_id, const std::string& npid) {
         bool fire_mutual; // true for self-connections; false for peers (deferred to
                           // OnPeerPacketReceived)
     };
+    struct DeferredStun {
+        s32 ctx_id;
+        s32 conn_id;
+        bool needs_stun;
+        bool is_host_peer; // HOST<->GUEST (true) or mesh (false)
+        u32 peer_addr;
+        u16 peer_port;
+        std::string peer_npid;
+    };
     std::vector<DeferredEvent> deferred;
+    std::vector<DeferredStun> stun_deferred;
     s32 result_cid = 0;
 
     {
@@ -269,13 +279,42 @@ s32 KernelP2PSubsystem::ActivatePeer(s32 ctx_id, const std::string& npid) {
                 conn.last_echo_sent = {}; // probe on next cycle
                 conn.last_event_time = std::chrono::steady_clock::now();
 
-                LOG_INFO(Lib_Net,
-                         "KernelP2P: ActivatePeer NEW npid='{}' conn_id={} "
-                         "peer_addr={:#x} ({}.{}.{}.{}) port={} (peer known, ACTIVE -- "
-                         "ESTABLISHED deferred to echo bilateral confirmation)",
-                         npid, cid, matched->addr, (ntohl(matched->addr) >> 24) & 0xff,
-                         (ntohl(matched->addr) >> 16) & 0xff, (ntohl(matched->addr) >> 8) & 0xff,
-                         ntohl(matched->addr) & 0xff, ntohs(matched->port));
+                // Check if STUN is needed. When replacing an INACTIVE connection,
+                // SetPeerInfo skips the STUN check (it bails early for INACTIVE
+                // conns). So this is the only place where STUN gets set up for
+                // reconnecting peers. Without this, echo probes go directly to the
+                // relay vport but no OFFER/ACCEPT establishes forwarding — the
+                // relay drops them and the peer is stuck as unreachable.
+                auto* sc_ap = stun_client_.load();
+                bool stun_usable_ap = (sc_ap != nullptr && sc_ap->GetMappedAddr() != 0);
+                bool peer_is_private_ap = false;
+                {
+                    u32 a = ntohl(matched->addr);
+                    peer_is_private_ap = ((a >> 24) == 10) ||
+                                         ((a >> 20) == 0xAC1) ||
+                                         ((a >> 16) == 0xC0A8) ||
+                                         ((a >> 24) == 127);
+                }
+                bool needs_stun_ap = (stun_usable_ap && !is_self && !peer_is_private_ap);
+                if (needs_stun_ap) {
+                    conn.stun_state = StunState::PENDING;
+                    stun_deferred.push_back({ctx_id, cid, true,
+                                             (my_member_id_ == 1 || matched->member_id == 1),
+                                             matched->addr, matched->port, npid});
+                    LOG_INFO(Lib_Net,
+                             "KernelP2P: ActivatePeer NEW npid='{}' conn_id={} "
+                             "peer_addr={:#x} port={} (peer known, STUN PENDING + echo parallel)",
+                             npid, cid, matched->addr, ntohs(matched->port));
+                } else {
+                    LOG_INFO(Lib_Net,
+                             "KernelP2P: ActivatePeer NEW npid='{}' conn_id={} "
+                             "peer_addr={:#x} ({}.{}.{}.{}) port={} (peer known, ACTIVE -- "
+                             "ESTABLISHED deferred to echo bilateral confirmation)",
+                             npid, cid, matched->addr, (ntohl(matched->addr) >> 24) & 0xff,
+                             (ntohl(matched->addr) >> 16) & 0xff,
+                             (ntohl(matched->addr) >> 8) & 0xff,
+                             ntohl(matched->addr) & 0xff, ntohs(matched->port));
+                }
 
                 connections_[cid] = conn;
                 npid_to_conn_[npid] = cid;
@@ -310,6 +349,12 @@ fire_deferred:
         FireEstablished(ev.ctx_id, ev.conn_id, 200);
         if (ev.fire_mutual) {
             FireMutualActivated(ev.ctx_id, ev.conn_id, 250);
+        }
+    }
+    // Queue STUN OFFERs for reconnecting peers (SetPeerInfo skipped INACTIVE conns).
+    for (const auto& st : stun_deferred) {
+        if (st.needs_stun && st.is_host_peer) {
+            QueueStunOffer(st.ctx_id, st.conn_id, st.peer_addr, st.peer_port, st.peer_npid);
         }
     }
     return result_cid;
