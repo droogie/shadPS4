@@ -133,6 +133,7 @@ s32 KernelP2PSubsystem::ActivatePeer(s32 ctx_id, const std::string& npid) {
     std::vector<DeferredEvent> deferred;
     std::vector<DeferredStun> stun_deferred;
     s32 result_cid = 0;
+    bool replacing_inactive = false;
 
     {
         std::lock_guard lock(mutex_);
@@ -145,6 +146,7 @@ s32 KernelP2PSubsystem::ActivatePeer(s32 ctx_id, const std::string& npid) {
             auto conn_it = connections_.find(cid);
             if (conn_it != connections_.end() && conn_it->second.state == ConnState::INACTIVE) {
                 // Stale deactivated entry -- clean up and fall through to new creation.
+                replacing_inactive = true;
                 LOG_INFO(Lib_Net,
                          "KernelP2P: ActivatePeer replacing INACTIVE conn_id={} for npid='{}'", cid,
                          npid);
@@ -279,23 +281,26 @@ s32 KernelP2PSubsystem::ActivatePeer(s32 ctx_id, const std::string& npid) {
                 conn.last_echo_sent = {}; // probe on next cycle
                 conn.last_event_time = std::chrono::steady_clock::now();
 
-                // Check if STUN is needed. When replacing an INACTIVE connection,
-                // SetPeerInfo skips the STUN check (it bails early for INACTIVE
-                // conns). So this is the only place where STUN gets set up for
-                // reconnecting peers. Without this, echo probes go directly to the
-                // relay vport but no OFFER/ACCEPT establishes forwarding — the
-                // relay drops them and the peer is stuck as unreachable.
-                auto* sc_ap = stun_client_.load();
-                bool stun_usable_ap = (sc_ap != nullptr && sc_ap->GetMappedAddr() != 0);
-                bool peer_is_private_ap = false;
-                {
-                    u32 a = ntohl(matched->addr);
-                    peer_is_private_ap = ((a >> 24) == 10) ||
-                                         ((a >> 20) == 0xAC1) ||
-                                         ((a >> 16) == 0xC0A8) ||
-                                         ((a >> 24) == 127);
+                // When replacing an INACTIVE connection, SetPeerInfo skipped the
+                // STUN check (it bails early for INACTIVE conns). Queue a STUN
+                // OFFER so the relay establishes forwarding for the new connection.
+                // Only do this for INACTIVE replacements — fresh connections already
+                // have STUN set up by SetPeerInfo, and a duplicate OFFER breaks the
+                // relay's forwarding state.
+                bool needs_stun_ap = false;
+                if (replacing_inactive) {
+                    auto* sc_ap = stun_client_.load();
+                    bool stun_usable_ap = (sc_ap != nullptr && sc_ap->GetMappedAddr() != 0);
+                    bool peer_is_private_ap = false;
+                    {
+                        u32 a = ntohl(matched->addr);
+                        peer_is_private_ap = ((a >> 24) == 10) ||
+                                             ((a >> 20) == 0xAC1) ||
+                                             ((a >> 16) == 0xC0A8) ||
+                                             ((a >> 24) == 127);
+                    }
+                    needs_stun_ap = (stun_usable_ap && !is_self && !peer_is_private_ap);
                 }
-                bool needs_stun_ap = (stun_usable_ap && !is_self && !peer_is_private_ap);
                 if (needs_stun_ap) {
                     conn.stun_state = StunState::PENDING;
                     stun_deferred.push_back({ctx_id, cid, true,
