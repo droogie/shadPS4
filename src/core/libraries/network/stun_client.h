@@ -64,6 +64,7 @@ struct StunBindingResult {
     u16 source_port{0};
     u32 changed_addr{0}; // server's alternate address
     u16 changed_port{0};
+    std::string username; // USERNAME attribute (peer NpId) from relay responses
 };
 
 // Result of NAT probing

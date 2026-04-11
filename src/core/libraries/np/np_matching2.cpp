@@ -3190,13 +3190,14 @@ s32 PS4_SYSV_ABI sceNpMatching2LeaveRoom(u16 ctxId, void* reqParam, void* optPar
     // Normal session lifecycle -- LeaveRoom fires at the appropriate time.
     NP_LOG("LeaveRoom: room_id={} cb={}", g_state.ctx.room_id, (void*)callback);
 
-    // Notify server
+    // Notify server (fire-and-forget — don't block the game thread).
     if (!g_state.ctx.session_id.empty()) {
         std::string body = "{";
         body += "\"SessionId\": \"" + g_state.ctx.session_id + "\",";
         body += "\"MemberId\": " + std::to_string(g_state.ctx.my_member_id);
         body += "}";
-        HttpPost("/mp/matching2/leave_room", body);
+        std::thread([body = std::move(body)]() { HttpPost("/mp/matching2/leave_room", body); })
+            .detach();
     }
 
     // Stop polling threads
@@ -3416,14 +3417,15 @@ s32 PS4_SYSV_ABI sceNpMatching2KickoutRoomMember(u16 ctxId, void* reqParam, void
     NP_LOG("API sceNpMatching2KickoutRoomMember: ctxId={} roomId={} memberId={}", ctxId,
            kick_room_id, kick_member_id);
 
-    // Notify server to kick the member and emit events
+    // Notify server to kick the member (fire-and-forget — don't block the game thread).
     if (!g_state.ctx.session_id.empty() && kick_member_id != 0) {
         std::string body = "{\"SessionId\":\"" + g_state.ctx.session_id +
                            "\",\"MemberId\":" + std::to_string(kick_member_id) +
                            ",\"KickerMemberId\":" + std::to_string(g_state.ctx.my_member_id) + "}";
-        std::string path = "/mp/matching2/kick_member";
-        auto resp = HttpPost(path, body);
-        NP_LOG("KickoutRoomMember: server POST {} -> '{}'", path, resp);
+        std::thread([body = std::move(body)]() {
+            auto resp = HttpPost("/mp/matching2/kick_member", body);
+            NP_LOG("KickoutRoomMember: server POST -> '{}'", resp);
+        }).detach();
     }
 
     return FireAndForgetCallback(ctxId, optParam, reqId,
@@ -4987,8 +4989,35 @@ s32 PS4_SYSV_ABI sceNpMatching2GetSslMemoryInfo() {
 // to resolve the peer's signaling address from our custom server.
 
 bool ResolvePeerSignalingAddr(const std::string& npid, u32& addr, u16& port) {
-    if (npid.empty() || g_state.server_host.empty())
+    if (npid.empty())
         return false;
+
+    // Resolve from local cache first (non-blocking). The peer's address is
+    // already known from SetPeerInfo which runs when the member joins.
+    // This avoids a blocking HTTP call on the game thread.
+    {
+        std::lock_guard<std::mutex> plock(g_state.peers_mutex);
+        for (const auto& [mid, pi] : g_state.peers) {
+            if (pi.online_id == npid && pi.addr != 0) {
+                addr = pi.addr;
+                port = pi.port;
+                char buf[INET_ADDRSTRLEN];
+                inet_ntop(AF_INET, &addr, buf, sizeof(buf));
+                LOG_INFO(Lib_NpMatching2,
+                         "ResolvePeerSignalingAddr: '{}' -> {}:{} (from local cache)",
+                         npid, buf, ntohs(port));
+                return true;
+            }
+        }
+    }
+
+    // Fallback: HTTP resolve if not in local cache (shouldn't happen in normal flow)
+    if (g_state.server_host.empty())
+        return false;
+
+    LOG_WARNING(Lib_NpMatching2,
+                "ResolvePeerSignalingAddr: '{}' not in local cache, falling back to HTTP resolve",
+                npid);
 
     std::string body = "{\"OnlineId\": \"" + npid + "\"}";
     auto resp = HttpPost("/np/signaling/resolve", body);
@@ -5010,7 +5039,8 @@ bool ResolvePeerSignalingAddr(const std::string& npid, u32& addr, u16& port) {
 
     addr = in.s_addr;
     port = htons(port_val);
-    LOG_INFO(Lib_NpMatching2, "ResolvePeerSignalingAddr: '{}' -> {}:{}", npid, addr_str, port_val);
+    LOG_INFO(Lib_NpMatching2, "ResolvePeerSignalingAddr: '{}' -> {}:{} (from HTTP)", npid, addr_str,
+             port_val);
     return true;
 }
 

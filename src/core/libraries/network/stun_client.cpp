@@ -978,7 +978,10 @@ StunBindingResult StunClient::WaitForRelay(u32 timeout_ms) {
         if (msg.data.size() >= STUN_HEADER_SIZE) {
             std::memcpy(any_txn, msg.data.data() + 4, 16);
         }
-        return ParseResponse(msg.data.data(), msg.data.size(), any_txn);
+        std::string relay_username;
+        auto result = ParseResponse(msg.data.data(), msg.data.size(), any_txn, &relay_username);
+        result.username = std::move(relay_username);
+        return result;
     }
     return {};
 }

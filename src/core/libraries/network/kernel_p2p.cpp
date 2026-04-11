@@ -1007,16 +1007,27 @@ void KernelP2PSubsystem::SendSignalingPacket(const u8* data, size_t len, u32 pee
 
 void KernelP2PSubsystem::HandleActivatePacket(u32 from_addr, u16 from_port, u32 peer_conn_id,
                                               u32 ctx_tag) {
-    // Find the peer's online_id by matching addr/port in our peers_ map
+    // Find the peer's online_id by matching addr+port in our peers_ map.
+    // Must match BOTH addr AND port — on LAN, multiple peers share the same IP.
     std::string peer_npid;
     std::string my_npid;
     {
         std::lock_guard lock(mutex_);
         my_npid = local_npid_;
+        // First try exact addr+port match
         for (const auto& [mid, pi] : peers_) {
-            if (pi.addr == from_addr) {
+            if (pi.addr == from_addr && pi.port == from_port) {
                 peer_npid = pi.npid;
                 break;
+            }
+        }
+        // Fallback: addr-only match (WAN peers where port may differ due to NAT)
+        if (peer_npid.empty()) {
+            for (const auto& [mid, pi] : peers_) {
+                if (pi.addr == from_addr) {
+                    peer_npid = pi.npid;
+                    break;
+                }
             }
         }
     }
@@ -1848,12 +1859,23 @@ void KernelP2PSubsystem::ProcessEchoProbe(u32 from_addr, u16 from_port, const u8
                             conn.echo_bilateral = true;
                             SetConnState(conn, ConnState::ACTIVE);
 
-                            // Firmware behavior: fire ESTABLISHED immediately when
-                            // bilateral is confirmed. No DATA exchange delay.
+                            // Event-driven: only fire ESTABLISHED if the game has
+                            // already called ActivateConnection (game_activated=true).
+                            // If not, defer — ActivatePeer will fire it when the game
+                            // is ready. This prevents the race where ESTABLISHED arrives
+                            // before the game's SocketState/P2P transport is set up.
+                            if (!conn.game_activated) {
+                                LOG_INFO(Lib_Net,
+                                         "KernelP2P: echo bilateral confirmed for conn_id={} "
+                                         "npid='{}' -- DEFERRED (game not activated yet, "
+                                         "will fire on ActivatePeer)",
+                                         cid, conn.npid);
+                            } else {
                             conn.events_fired = true;
                             conn.mutual_fired = true;
                             conn.last_event_time = now_tp;
                             to_fire.push_back({conn.ctx_id, cid});
+                            }
                             LOG_INFO(Lib_Net,
                                      "KernelP2P: echo bilateral confirmed for conn_id={} "
                                      "npid='{}' after {} probes/{} responses rtt={}us "
@@ -1968,6 +1990,17 @@ void KernelP2PSubsystem::ProcessStunOffer(s32 ctx_id, s32 conn_id, u32 peer_addr
         // Short timeout -- the signaling thread's main loop will catch the
         // ACCEPT as an incoming relay if we miss it here.
         auto accept = sc_offer->WaitForRelay(500);
+
+        // Validate STUN response matches the expected peer before accepting.
+        // On same-NAT, multiple peers share an IP — the relay can return the
+        // wrong peer's response. Check USERNAME (peer NpId) if available.
+        if (accept.success && !accept.username.empty() && accept.username != peer_npid) {
+            LOG_WARNING(Lib_Net,
+                        "KernelP2P: STUN ACCEPT username mismatch for conn_id={}: "
+                        "expected='{}' got='{}' -- ignoring stale relay response",
+                        conn_id, peer_npid, accept.username);
+            accept.success = false;
+        }
 
         // Update connection state under lock, then send NAT punch outside lock
         // (sendto + sleep_for while holding mutex_ starves other threads for ~100ms).

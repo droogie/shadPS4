@@ -966,30 +966,51 @@ s32 PS4_SYSV_ABI sceNpSignalingDeactivateConnection(s32 ctxId, s32 connId) {
     }
     int call_num = ++s_deactivate_count;
 
-    // Get peer addr for flush, but do NOT reset state -- the state machine
-    // continues independently and may still advance to ACTIVE.
+    // Get peer NpId and addr for flush. The NpSignaling conn_id and kernel
+    // conn_id are in DIFFERENT ID spaces (assigned independently), so we must
+    // resolve by NpId, not pass the sig conn_id directly to the kernel.
     u32 peer_addr = 0;
     u16 peer_port = 0;
+    std::string peer_npid;
     {
         std::lock_guard lock(s_sig_mutex);
         auto it = s_sig_connections.find(connId);
         if (it != s_sig_connections.end()) {
             peer_addr = it->second.peer_addr;
             peer_port = it->second.peer_port;
+            peer_npid = it->second.npid;
             LOG_INFO(Lib_NpSignaling,
-                     "DeactivateConnection[#{}]: ctxId={} connId={} npid='{}' state={} -- "
-                     "kernel deactivated, NpSignaling state PRESERVED",
+                     "DeactivateConnection[#{}]: ctxId={} sigConnId={} npid='{}' state={} -- "
+                     "resolving kernel conn by NpId",
                      call_num, ctxId, connId, it->second.npid, it->second.state);
         } else if (connId > 0 && (call_num <= 5 || call_num % 100 == 0)) {
             LOG_INFO(Lib_NpSignaling,
-                     "DeactivateConnection[#{}]: ctxId={} connId={} -- not found, no-op", call_num,
-                     ctxId, connId);
+                     "DeactivateConnection[#{}]: ctxId={} sigConnId={} -- not found, no-op",
+                     call_num, ctxId, connId);
         }
     }
 
-    // Step 2: Deactivate in kernel subsystem (P2P routing cleanup).
+    // Step 2: Deactivate in kernel subsystem by NpId (NOT by sig conn_id).
+    // The kernel assigns its own conn_ids via SetPeerInfo, which differ from
+    // the NpSignaling conn_ids assigned by ActivateConnection.
     auto& kernel = Libraries::Net::KernelP2PSubsystem::Instance();
-    kernel.DeactivatePeer(connId);
+    if (!peer_npid.empty()) {
+        s32 kernel_conn_id = kernel.GetConnIdByNpid(peer_npid);
+        if (kernel_conn_id > 0) {
+            LOG_INFO(Lib_NpSignaling,
+                     "DeactivateConnection[#{}]: resolved npid='{}' -> kernel conn_id={} "
+                     "(sig conn_id={})",
+                     call_num, peer_npid, kernel_conn_id, connId);
+            kernel.DeactivatePeer(kernel_conn_id);
+        } else {
+            LOG_INFO(Lib_NpSignaling,
+                     "DeactivateConnection[#{}]: npid='{}' not found in kernel (already cleaned up)",
+                     call_num, peer_npid);
+        }
+    } else if (connId > 0) {
+        // Fallback: no NpId available, try direct conn_id (legacy path)
+        kernel.DeactivatePeer(connId);
+    }
 
     // Step 3: Flush buffered P2P packets from the deactivated peer.
     if (peer_addr != 0) {
