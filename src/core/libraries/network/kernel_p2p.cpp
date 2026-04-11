@@ -34,6 +34,19 @@ static constexpr s32 CONN_STATUS_ACTIVE = 2;
 
 namespace Libraries::Net {
 
+// Firmware-style state setter (matches sub_4089f0 pattern).
+// Records previous state, sets new state, records timestamp.
+// PeerConnection and ConnState are private, but this is in the .cpp
+// where all member access is through KernelP2PSubsystem methods.
+namespace {
+template <typename Conn, typename State>
+void SetConnState(Conn& conn, State new_state) {
+    conn.prev_state = conn.state;
+    conn.state = new_state;
+    conn.state_changed_at = std::chrono::steady_clock::now();
+}
+} // namespace
+
 KernelP2PSubsystem& KernelP2PSubsystem::Instance() {
     static KernelP2PSubsystem instance;
     return instance;
@@ -184,7 +197,7 @@ s32 KernelP2PSubsystem::ActivatePeer(s32 ctx_id, const std::string& npid) {
                     }
                 } else if (conn.addr != 0 && !conn.events_fired) {
                     // Connection has peer data but ESTABLISHED hasn't fired yet.
-                    conn.state = ConnState::ACTIVE;
+                    SetConnState(conn, ConnState::ACTIVE);
                     conn.game_activated = true;
 
                     if (!conn.echo_started) {
@@ -247,7 +260,7 @@ s32 KernelP2PSubsystem::ActivatePeer(s32 ctx_id, const std::string& npid) {
                 // Both sides are local -- bilateral by definition, fire MUTUAL immediately.
                 conn.addr = local_addr_;
                 conn.port = local_port_;
-                conn.state = ConnState::ACTIVE;
+                SetConnState(conn, ConnState::ACTIVE);
                 conn.events_fired = true;
                 conn.mutual_fired = true;
                 conn.last_event_time = std::chrono::steady_clock::now();
@@ -269,7 +282,7 @@ s32 KernelP2PSubsystem::ActivatePeer(s32 ctx_id, const std::string& npid) {
                 // deferred to echo probe bilateral confirmation (~1.5s).
                 conn.addr = matched->addr;
                 conn.port = matched->port;
-                conn.state = ConnState::ACTIVE;
+                SetConnState(conn, ConnState::ACTIVE);
                 conn.game_activated = true; // game explicitly activated
                 conn.events_fired = false;  // deferred to echo bilateral confirmation
                 conn.mutual_fired = false;
@@ -327,7 +340,7 @@ s32 KernelP2PSubsystem::ActivatePeer(s32 ctx_id, const std::string& npid) {
             // Peer NOT yet known -- defer events until SetPeerInfo resolves
             conn.addr = 0;
             conn.port = 0;
-            conn.state = ConnState::PENDING;
+            SetConnState(conn, ConnState::PENDING);
             conn.game_activated = true; // game explicitly activated
             conn.events_fired = false;
 
@@ -378,7 +391,7 @@ int KernelP2PSubsystem::DeactivatePeer(s32 conn_id) {
                      "KernelP2P: DeactivatePeer conn_id={} npid='{}' state={} -> INACTIVE "
                      "(full echo state reset)",
                      conn_id, it->second.npid, static_cast<int>(it->second.state));
-            it->second.state = ConnState::INACTIVE;
+            SetConnState(it->second, ConnState::INACTIVE);
             it->second.events_fired = false;
             it->second.mutual_fired = false;
             // Full reset of echo/signaling state so re-activation starts fresh.
@@ -745,7 +758,7 @@ void KernelP2PSubsystem::SetPeerInfo(u16 member_id, u32 addr, u16 port, const st
                         // Echo probes start immediately in parallel with STUN --
                         // if direct connectivity works (port forwarding), echo
                         // bilateral confirms without waiting for STUN relay.
-                        conn.state = ConnState::ACTIVE;
+                        SetConnState(conn, ConnState::ACTIVE);
                         conn.stun_state = StunState::PENDING;
                         conn.events_fired = false;
                         conn.echo_started = true;
@@ -766,7 +779,7 @@ void KernelP2PSubsystem::SetPeerInfo(u16 member_id, u32 addr, u16 port, const st
                         // Deterministic role: higher member_id sends OFFER,
                         // lower waits for incoming OFFER via relay loop.
                         bool i_send_offer = (my_member_id_ > member_id);
-                        conn.state = ConnState::ACTIVE;
+                        SetConnState(conn, ConnState::ACTIVE);
                         conn.stun_state = StunState::PENDING;
                         conn.events_fired = false;
                         conn.echo_started = true;
@@ -780,7 +793,7 @@ void KernelP2PSubsystem::SetPeerInfo(u16 member_id, u32 addr, u16 port, const st
                         deferred.push_back({conn.ctx_id, conn.conn_id, true, i_send_offer});
                     } else {
                         // Start echo probes immediately to create NAT mappings.
-                        conn.state = ConnState::ACTIVE;
+                        SetConnState(conn, ConnState::ACTIVE);
                         conn.stun_state = StunState::NONE;
                         conn.events_fired = false;
                         conn.echo_started = true;
@@ -842,7 +855,7 @@ void KernelP2PSubsystem::RemovePeer(u16 member_id) {
                 if (conn.state == ConnState::ACTIVE) {
                     dead_events.push_back({conn.ctx_id, conn.conn_id});
                 }
-                conn.state = ConnState::INACTIVE;
+                SetConnState(conn, ConnState::INACTIVE);
             }
         }
 
@@ -1327,7 +1340,7 @@ void KernelP2PSubsystem::SignalingThreadFunc() {
                 // actual NAT-mapped address from the peer's NatProbe.
                 matched_conn->addr = relay.mapped_addr;
                 matched_conn->port = relay.mapped_port;
-                matched_conn->state = ConnState::ACTIVE;
+                SetConnState(*matched_conn, ConnState::ACTIVE);
                 matched_conn->stun_state = StunState::COMPLETE;
 
                 // Start echo probes immediately at STUN COMPLETE, even before
@@ -1590,7 +1603,7 @@ void KernelP2PSubsystem::SendEchoProbes() {
                                  conn.echo_probes_sent, conn.echo_responses_received);
                     } else {
                         // Zero responses -- peer genuinely unreachable, fire DEAD
-                        conn.state = ConnState::INACTIVE;
+                        SetConnState(conn, ConnState::INACTIVE);
                         conn.echo_started = false;
                         conn.events_fired = false;
                         unreachable_dead.push_back({conn.ctx_id, cid});
@@ -1833,7 +1846,7 @@ void KernelP2PSubsystem::ProcessEchoProbe(u32 from_addr, u16 from_port, const u8
                         if (!conn.echo_bilateral) {
                             // First time reaching bilateral threshold
                             conn.echo_bilateral = true;
-                            conn.state = ConnState::ACTIVE;
+                            SetConnState(conn, ConnState::ACTIVE);
 
                             // Firmware behavior: fire ESTABLISHED immediately when
                             // bilateral is confirmed. No DATA exchange delay.
@@ -2064,13 +2077,13 @@ void KernelP2PSubsystem::OnPeerPacketReceived(u32 peer_addr) {
     }
 
     for (const auto& ev : to_fire) {
-        // Delay MUTUAL by 3s so SocketState state 9 (sendHandshakeType2) blocks
-        // long enough for ConnObj's slow path to read SigDataManager data.
+        // Firmware fires MUTUAL_ACTIVATED immediately after ESTABLISHED.
+        // No artificial delay.
         LOG_INFO(Lib_Net,
                  "KernelP2P: OnPeerPacketReceived -- bilateral P2P confirmed, "
-                 "firing MUTUAL_ACTIVATED for conn_id={} (3000ms, emulates STUN timing)",
+                 "firing MUTUAL_ACTIVATED for conn_id={}",
                  ev.conn_id);
-        FireMutualActivated(ev.ctx_id, ev.conn_id, 3000);
+        FireMutualActivated(ev.ctx_id, ev.conn_id, 50);
     }
 }
 

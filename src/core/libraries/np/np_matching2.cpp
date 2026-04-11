@@ -475,7 +475,8 @@ void DrainReadyEvents() {
     if (ready.empty())
         return;
 
-    // Sort by type priority: CONTEXT < REQUEST < SIGNALING < ROOM_EVENT
+    // Sort by type priority: CONTEXT < REQUEST < ROOM_EVENT < SIGNALING
+    // Room events must fire before signaling so game creates ConnectionObjects first.
     // Within same type, preserve insertion order (stable_sort).
     std::stable_sort(ready.begin(), ready.end(), [](const PendingEvent& a, const PendingEvent& b) {
         return static_cast<int>(a.type) < static_cast<int>(b.type);

@@ -260,28 +260,30 @@ private:
         u16 mapped_port{0}; // STUN-resolved external port (NBO)
         std::string npid;
         ConnState state{ConnState::INACTIVE};
+        ConnState prev_state{ConnState::INACTIVE}; // firmware pattern: sub_4089f0 saves old state
         StunState stun_state{StunState::NONE};
-        bool events_fired{false}; // ESTABLISHED has been fired
-        bool mutual_fired{false}; // MUTUAL_ACTIVATED has been fired (bilateral confirmation)
-        std::chrono::steady_clock::time_point last_event_time{};
+
+        // Event tracking flags (orthogonal concerns, see Phase 3 audit).
+        bool events_fired{false}; // ESTABLISHED callback has been delivered
+        bool mutual_fired{false}; // MUTUAL_ACTIVATED callback has been delivered
+        bool game_activated{false}; // game called sceNpSignalingActivateConnection
+
+        // Firmware-style timestamps (sub_4089f0 pattern: records time of each state change).
+        std::chrono::steady_clock::time_point state_changed_at{}; // when state last changed
+        std::chrono::steady_clock::time_point last_event_time{};  // when last event was fired
 
         // Echo probe state for bilateral connectivity confirmation.
-        // 90-byte probes on vport 0xFFFD, sent every 500ms until bilateral,
-        // then keepalive probes every 10s.
-        bool game_activated{false};     // game called ActivateConnection for this conn
+        // Firmware: SceNpMatching2SigEcho thread, 200ms tick (callout 0x30d40 us),
+        // 60s keepalive after ESTABLISHED, 30s connection timeout.
         bool echo_started{false};       // probes are being sent
         int echo_probes_sent{0};        // total probes sent
         int echo_responses_received{0}; // responses from peer
-        // echo_retries removed: firmware uses single 30-second connection timeout
-        bool echo_bilateral{false};     // bilateral confirmation achieved
+        bool echo_bilateral{false};     // bilateral confirmation achieved (>= 3 responses)
         std::chrono::steady_clock::time_point last_echo_sent{};
-        std::chrono::steady_clock::time_point echo_start_at{}; // when to actually begin probing
+        std::chrono::steady_clock::time_point echo_start_at{}; // when probing began
         s32 rtt_us{0};        // measured round-trip time in microseconds
         s32 bandwidth_bps{0}; // computed bandwidth in bytes/sec
         std::chrono::steady_clock::time_point last_echo_recv{};
-
-        // DATA exchange phase removed: firmware has no such mechanism.
-        // ESTABLISHED fires immediately when bilateral confirmation is achieved.
     };
 
     struct PeerInfo {
