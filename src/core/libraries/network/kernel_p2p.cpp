@@ -205,16 +205,25 @@ s32 KernelP2PSubsystem::ActivatePeer(s32 ctx_id, const std::string& npid) {
                         conn.last_echo_sent = {};
                     }
 
-                    if (conn.echo_bilateral) {
-                        // Bilateral done -- fire immediately
+                    bool stun_ready_ap = (conn.stun_state == StunState::COMPLETE ||
+                                          conn.stun_state == StunState::NONE ||
+                                          conn.stun_state == StunState::FAILED);
+                    if (conn.echo_bilateral && stun_ready_ap) {
+                        // Bilateral done + STUN ready -- fire immediately
                         conn.events_fired = true;
                         conn.mutual_fired = true;
                         conn.last_event_time = std::chrono::steady_clock::now();
                         deferred.push_back({ctx_id, cid, true});
                         LOG_INFO(Lib_Net,
                                  "KernelP2P: ActivatePeer EXISTING npid='{}' conn_id={} "
-                                 "echo bilateral already done -- firing ESTABLISHED now",
+                                 "echo bilateral + STUN ready -- firing ESTABLISHED now",
                                  npid, cid);
+                    } else if (conn.echo_bilateral) {
+                        // Bilateral done but STUN still pending -- defer
+                        LOG_INFO(Lib_Net,
+                                 "KernelP2P: ActivatePeer EXISTING npid='{}' conn_id={} "
+                                 "echo bilateral done but STUN={} -- deferring ESTABLISHED",
+                                 npid, cid, static_cast<int>(conn.stun_state));
                     } else {
                         LOG_INFO(Lib_Net,
                                  "KernelP2P: ActivatePeer EXISTING npid='{}' conn_id={} "
@@ -1366,14 +1375,14 @@ void KernelP2PSubsystem::SignalingThreadFunc() {
                              matched_conn->conn_id);
                 }
 
-                // Only fire ESTABLISHED if the game has already called
-                // ActivateConnection. If not yet activated (e.g., STUN completed
-                // during invite poll), ActivatePeer will fire events when called.
-                if (matched_conn->game_activated) {
-                    matched_conn->events_fired = true;
-                    matched_conn->mutual_fired = true;
-                    matched_conn->last_event_time = std::chrono::steady_clock::now();
-                }
+                // Fire ESTABLISHED only when ALL three conditions are met:
+                // game_activated + echo_bilateral + STUN ready.
+                // This ensures both the P2P tunnel AND the game are ready.
+                // Event firing is handled by the ACCEPT handler below
+                // (checks game_activated + echo_bilateral + !events_fired).
+                // Just queue the ACCEPT here.
+                to_accept.push_back({matched_conn->ctx_id, matched_conn->conn_id,
+                                     relay.mapped_addr, relay.mapped_port});
 
                 LOG_INFO(Lib_Net,
                          "KernelP2P: STUN relay resolved conn_id={} npid='{}' -> "
@@ -1448,7 +1457,11 @@ void KernelP2PSubsystem::SignalingThreadFunc() {
             {
                 std::lock_guard lock(mutex_);
                 auto it = connections_.find(ev.conn_id);
-                if (it != connections_.end() && it->second.game_activated) {
+                if (it != connections_.end() && it->second.game_activated &&
+                    it->second.echo_bilateral && !it->second.events_fired) {
+                    it->second.events_fired = true;
+                    it->second.mutual_fired = true;
+                    it->second.last_event_time = std::chrono::steady_clock::now();
                     should_fire = true;
                 }
             }
@@ -1457,8 +1470,8 @@ void KernelP2PSubsystem::SignalingThreadFunc() {
                 FireMutualActivated(ev.ctx_id, ev.conn_id, 250);
             } else {
                 LOG_INFO(Lib_Net,
-                         "KernelP2P: STUN ACCEPT sent for conn_id={} but game not activated yet "
-                         "-- deferring ESTABLISHED to ActivatePeer",
+                         "KernelP2P: STUN ACCEPT sent for conn_id={} -- not all conditions met "
+                         "for ESTABLISHED (game/bilateral/stun will converge)",
                          ev.conn_id);
             }
         }
@@ -1575,6 +1588,25 @@ void KernelP2PSubsystem::SendEchoProbes() {
             // Firmware connection timeout: 30 seconds (0x1c9c380 us).
             // If no bilateral confirmation within this window, fire DEAD.
             static constexpr auto CONNECTION_TIMEOUT = std::chrono::seconds(30);
+
+            // Timeout for PENDING connections with no address (peer never joined room).
+            // The game can call ActivateConnection for peers that aren't reachable
+            // (e.g., left before joining). Without this, the connection sits as a
+            // zombie (addr=0, echo_started=false) forever.
+            if (conn.state == ConnState::PENDING && conn.addr == 0 && conn.game_activated &&
+                !conn.events_fired) {
+                if (conn.state_changed_at != std::chrono::steady_clock::time_point{} &&
+                    (now - conn.state_changed_at) >= CONNECTION_TIMEOUT) {
+                    SetConnState(conn, ConnState::INACTIVE);
+                    conn.events_fired = false;
+                    unreachable_dead.push_back({conn.ctx_id, cid});
+                    LOG_WARNING(Lib_Net,
+                                "KernelP2P: PENDING connection timeout -- conn_id={} npid='{}' "
+                                "addr=0 after 30s -- peer never joined, firing DEAD",
+                                cid, conn.npid);
+                }
+            }
+
             if (conn.echo_started && !conn.events_fired && !conn.echo_bilateral &&
                 conn.game_activated) {
                 if (conn.echo_start_at == std::chrono::steady_clock::time_point{}) {
@@ -1843,17 +1875,22 @@ void KernelP2PSubsystem::ProcessEchoProbe(u32 from_addr, u16 from_port, const u8
                             conn.echo_bilateral = true;
                             SetConnState(conn, ConnState::ACTIVE);
 
-                            // Event-driven: only fire ESTABLISHED if the game has
-                            // already called ActivateConnection (game_activated=true).
-                            // If not, defer — ActivatePeer will fire it when the game
-                            // is ready. This prevents the race where ESTABLISHED arrives
-                            // before the game's SocketState/P2P transport is set up.
-                            if (!conn.game_activated) {
+                            // Event-driven: only fire ESTABLISHED when BOTH conditions met:
+                            // 1. game_activated = true (game called ActivateConnection)
+                            // 2. STUN is ready (COMPLETE or NONE, not PENDING)
+                            // This prevents the race where ESTABLISHED fires before the
+                            // P2P tunnel is fully set up (especially on WAN where STUN
+                            // takes 100-500ms). ActivatePeer will fire when both are ready.
+                            bool stun_ready = (conn.stun_state == StunState::COMPLETE ||
+                                               conn.stun_state == StunState::NONE ||
+                                               conn.stun_state == StunState::FAILED);
+                            if (!conn.game_activated || !stun_ready) {
                                 LOG_INFO(Lib_Net,
                                          "KernelP2P: echo bilateral confirmed for conn_id={} "
-                                         "npid='{}' -- DEFERRED (game not activated yet, "
-                                         "will fire on ActivatePeer)",
-                                         cid, conn.npid);
+                                         "npid='{}' -- DEFERRED (game_activated={} stun={}, "
+                                         "will fire when both ready)",
+                                         cid, conn.npid, conn.game_activated,
+                                         static_cast<int>(conn.stun_state));
                             } else {
                             conn.events_fired = true;
                             conn.mutual_fired = true;
