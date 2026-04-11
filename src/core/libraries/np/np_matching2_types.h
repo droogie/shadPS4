@@ -182,14 +182,18 @@ struct OrbisNpMatching2LeaveRoomRequest {
 };
 static_assert(sizeof(OrbisNpMatching2LeaveRoomRequest) == 0x20);
 
+// RE: handleEvent_type2 (0x10be5e0) reads +0x08 (worldId), +0x0C (lobbyCount),
+//      +0x18 and +0x1C from each 0x28-byte entry via sub_1091ab0.
+//      Linked list pointer at +0x00 (next).
 struct OrbisNpMatching2World {
-    u64 _pad_00;       // +0x00
-    u32 worldId;       // +0x08
-    u32 _pad_0C;       // +0x0C
-    u64 _pad_10;       // +0x10
-    u32 curNumOfLobby; // +0x18
-    u32 maxNumOfLobby; // +0x1C
-    u64 _pad_20;       // +0x20
+    OrbisNpMatching2World* next; // +0x00
+    u32 worldId;                 // +0x08
+    u32 lobbyCount;              // +0x0C — handleEvent_type2 reads this; 0 = no lobbies = lobby dead
+    u32 maxLobbyMembers;         // +0x10
+    u32 curLobbyMembers;         // +0x14
+    u32 curRooms;                // +0x18 — read by handleEvent_type2
+    u32 curRoomMembers;          // +0x1C — read by handleEvent_type2
+    u8 _pad_20[8];               // +0x20
 };
 static_assert(sizeof(OrbisNpMatching2World) == 0x28);
 
@@ -263,6 +267,10 @@ struct OrbisNpMatching2ExtraInitParam {
 using OrbisNpMatching2LobbyMemberId = u16;
 using OrbisNpMatching2AttributeId = u16;
 
+// RE: sceNpMatching2DefaultCallback (0x10bd4a0) dispatches on event code:
+//   0x0002 → handleEvent_type2 (GetWorldInfoList response)
+//   0x0106 → handleEvent_0x106 (SearchRoom response)
+constexpr u16 ORBIS_NP_MATCHING2_REQUEST_EVENT_GET_WORLD_INFO_LIST = 0x0002;
 constexpr u16 ORBIS_NP_MATCHING2_REQUEST_EVENT_GET_LOBBY_INFO_LIST = 0x0006;
 constexpr u16 ORBIS_NP_MATCHING2_REQUEST_EVENT_JOIN_LOBBY = 0x0201;
 constexpr u16 ORBIS_NP_MATCHING2_REQUEST_EVENT_LEAVE_LOBBY = 0x0202;
@@ -271,9 +279,12 @@ constexpr u16 ORBIS_NP_MATCHING2_REQUEST_EVENT_SET_LOBBY_MEMBER_DATA_INTERNAL = 
 constexpr u16 ORBIS_NP_MATCHING2_REQUEST_EVENT_GET_LOBBY_MEMBER_DATA_INTERNAL = 0x0206;
 constexpr u16 ORBIS_NP_MATCHING2_REQUEST_EVENT_GET_LOBBY_MEMBER_DATA_INTERNAL_LIST = 0x0207;
 
+// Lobby event codes (from RE of mcp_NpMatching2_LobbyEventCallback at 0x10bd720)
+// The callback checks: 0x3201/0x3202 → 0x28 bytes, 0x3203 → 0x8 bytes, 0x3204 → 0x50 bytes
 constexpr u16 ORBIS_NP_MATCHING2_LOBBY_EVENT_MEMBER_JOINED = 0x3201;
 constexpr u16 ORBIS_NP_MATCHING2_LOBBY_EVENT_MEMBER_LEFT = 0x3202;
 constexpr u16 ORBIS_NP_MATCHING2_LOBBY_EVENT_LOBBY_DESTROYED = 0x3203;
+// 0x3204 = member data updated (0x50 bytes), 0x4201 = chat message, 0x4202 = invitation
 
 struct OrbisNpMatching2LobbyMemberIdList {
     OrbisNpMatching2LobbyMemberId* memberId; // +0x00
@@ -300,17 +311,19 @@ struct OrbisNpMatching2JoinLobbyResponse {
     OrbisNpMatching2LobbyDataInternal* lobbyDataInternal; // +0x00
 };
 
+// RE: lobby event callback (0x10bd720) copies 0x28 bytes for 0x3201/0x3202 events.
+// The update info struct at 0x28 bytes wraps a pointer to this 0x60-byte member data.
 struct OrbisNpMatching2LobbyMemberDataInternal {
     struct OrbisNpMatching2LobbyMemberDataInternal* next; // +0x00
     u64 joinDate;                                         // +0x08
-    OrbisNpId npId;                                       // +0x10
+    OrbisNpId npId;                                       // +0x10 (36 bytes)
     OrbisNpMatching2LobbyMemberId memberId;               // +0x34
     u8 _pad_36[2];                                        // +0x36
-    u8 reserved[8];                                       // +0x38
+    u8 _reserved[8];                                      // +0x38
     void* joinedSessionInfo;                              // +0x40
     u64 joinedSessionInfoNum;                             // +0x48
-    void* lobbyMemberBinAttrInternal;                     // +0x50
-    u64 lobbyMemberBinAttrInternalNum;                    // +0x58
+    void* memberBinAttrInternal;                          // +0x50
+    u64 memberBinAttrInternalNum;                         // +0x58
 };
 static_assert(sizeof(OrbisNpMatching2LobbyMemberDataInternal) == 0x60);
 

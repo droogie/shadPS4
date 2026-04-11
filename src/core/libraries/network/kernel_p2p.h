@@ -76,10 +76,8 @@ public:
 
     // Get connection status and peer address.
     // Returns ORBIS_NP_SIGNALING_CONN_STATUS_* values.
-    // When delayed=true, returns PENDING briefly after ESTABLISHED fires,
-    // giving the SocketState pipeline time to populate SigDataManager.
-    int GetConnectionStatus(s32 conn_id, s32* status_out, u32* addr_out, u16* port_out,
-                            bool delayed = false);
+    // Firmware behavior: immediate state read, no gates or delays.
+    int GetConnectionStatus(s32 conn_id, s32* status_out, u32* addr_out, u16* port_out);
 
     // Get connection info by type (RTT, bandwidth, peer NpId, peer addr, etc.)
     int GetConnectionInfo(s32 conn_id, s32 info_type, void* info);
@@ -266,10 +264,6 @@ private:
         bool events_fired{false}; // ESTABLISHED has been fired
         bool mutual_fired{false}; // MUTUAL_ACTIVATED has been fired (bilateral confirmation)
         std::chrono::steady_clock::time_point last_event_time{};
-        // GCS delay: memberId-based GetConnectionStatus returns PENDING until
-        // this timestamp, while connId-based returns ACTIVE immediately.
-        // 150ms delay lets SocketState populate SigDataManager before ConnObj reads it.
-        std::chrono::steady_clock::time_point gcs_active_at{};
 
         // Echo probe state for bilateral connectivity confirmation.
         // 90-byte probes on vport 0xFFFD, sent every 500ms until bilateral,
@@ -278,7 +272,7 @@ private:
         bool echo_started{false};       // probes are being sent
         int echo_probes_sent{0};        // total probes sent
         int echo_responses_received{0}; // responses from peer
-        int echo_retries{0};            // unreachable retry count (mesh peers may join late)
+        // echo_retries removed: firmware uses single 30-second connection timeout
         bool echo_bilateral{false};     // bilateral confirmation achieved
         std::chrono::steady_clock::time_point last_echo_sent{};
         std::chrono::steady_clock::time_point echo_start_at{}; // when to actually begin probing
@@ -286,13 +280,8 @@ private:
         s32 bandwidth_bps{0}; // computed bandwidth in bytes/sec
         std::chrono::steady_clock::time_point last_echo_recv{};
 
-        // DATA exchange phase (LAN only).
-        // Delays ESTABLISHED after echo bilateral to give the game time to
-        // create SocketState entries for 3+ player sessions. Without this,
-        // drainSignalingEvents kills the connection before it can be used.
-        // STUN/self-connections skip this.
-        bool data_phase_active{false};
-        std::chrono::steady_clock::time_point data_phase_start{};
+        // DATA exchange phase removed: firmware has no such mechanism.
+        // ESTABLISHED fires immediately when bilateral confirmation is achieved.
     };
 
     struct PeerInfo {

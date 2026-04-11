@@ -534,6 +534,9 @@ void DrainReadyEvents() {
         switch (ev.type) {
         case PendingEvent::CONTEXT_CB:
             if (g_state.context_callback) {
+                fprintf(stderr, "[NpM2] CB_CONTEXT: ctxId=%d event=0x%x cause=%d err=%d\n",
+                        g_state.ctx.ctx_id, ev.ctx_event, ev.ctx_event_cause, ev.error_code);
+                fflush(stderr);
                 NP_LOG("CB_CONTEXT: ctxId={} event={:#x} cause={} err={} cb={} arg={}",
                        g_state.ctx.ctx_id, ev.ctx_event, ev.ctx_event_cause, ev.error_code,
                        (void*)g_state.context_callback, g_state.context_callback_arg);
@@ -552,6 +555,10 @@ void DrainReadyEvents() {
                     break;
                 }
                 void* data = ev.request_data;
+                fprintf(stderr, "[NpM2] CB_REQUEST: ctxId=%d reqId=%d event=0x%x err=%d data=%p cb=%p\n",
+                        g_state.ctx.ctx_id, ev.req_id, ev.req_event, ev.error_code, data,
+                        (void*)ev.request_cb);
+                fflush(stderr);
                 NP_LOG("CB_REQUEST: ctxId={} reqId={} event={:#x} err={} data={} "
                        "cb={} arg={}",
                        g_state.ctx.ctx_id, ev.req_id, ev.req_event, ev.error_code, data,
@@ -3651,8 +3658,8 @@ struct AsyncJoinLobbyArgs {
 static PS4_SYSV_ABI void* JoinLobbyThreadFunc(void* arg) {
     auto* a = static_cast<AsyncJoinLobbyArgs*>(arg);
 
-    // Delay to ensure the API call returns first (same pattern as JoinRoomThreadFunc)
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    // Small delay for API call to return first
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
     // Query server for connected players (lobby membership)
     auto resp = HttpGet("/mp/matching2/lobby_members?OnlineId=" + g_state.ctx.online_id);
@@ -3769,6 +3776,9 @@ static PS4_SYSV_ABI void* JoinLobbyThreadFunc(void* arg) {
 }
 
 s32 PS4_SYSV_ABI sceNpMatching2JoinLobby(u16 ctxId, void* reqParam, void* optParam, s32* reqId) {
+    fprintf(stderr, "[NpM2] >>> sceNpMatching2JoinLobby CALLED ctxId=%d reqParam=%p\n",
+            ctxId, reqParam);
+    fflush(stderr);
     NP_LOG("API sceNpMatching2JoinLobby: called ctxId={} reqParam={} optParam={}", ctxId, reqParam,
            optParam);
 
@@ -3992,6 +4002,9 @@ static PS4_SYSV_ABI void* GetLobbyInfoListThreadFunc(void* arg) {
 
 s32 PS4_SYSV_ABI sceNpMatching2GetLobbyInfoList(u16 ctxId, void* reqParam, void* optParam,
                                                 s32* reqId) {
+    fprintf(stderr, "[NpM2] >>> sceNpMatching2GetLobbyInfoList CALLED ctxId=%d reqParam=%p\n",
+            ctxId, reqParam);
+    fflush(stderr);
     NP_LOG("API sceNpMatching2GetLobbyInfoList: ctxId={}", ctxId);
 
     OrbisNpMatching2RequestCallback callback = nullptr;
@@ -4454,8 +4467,9 @@ struct AsyncGetWorldInfoArgs {
 static PS4_SYSV_ABI void* GetWorldInfoListThreadFunc(void* arg) {
     auto* a = static_cast<AsyncGetWorldInfoArgs*>(arg);
 
-    // Small delay to ensure the API call returns first
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    // No delay — fire callback immediately so NxrvEvent 0x29 (world data)
+    // is queued BEFORE the NXRV task dispatcher fires NxrvEvent 0x10 (task done).
+    // processEvent0x10 needs the world data to be available when it runs.
 
     LOG_INFO(Lib_NpMatching2, "GetWorldInfoList async: firing callback with 1 world");
 
@@ -4463,25 +4477,37 @@ static PS4_SYSV_ABI void* GetWorldInfoListThreadFunc(void* arg) {
     // These are kept in g_state for lifetime management (game may reference them later)
     static OrbisNpMatching2World s_world{};
     std::memset(&s_world, 0, sizeof(s_world));
+    s_world.next = nullptr;
     s_world.worldId = 1;
-    s_world.curNumOfLobby = 1;
-    s_world.maxNumOfLobby = 10;
+    s_world.lobbyCount = 1;       // +0x0C: handleEvent_type2 reads this; 0 = lobby system dead
+    s_world.maxLobbyMembers = 256;
+    s_world.curLobbyMembers = 1;
+    s_world.curRooms = 0;
+    s_world.curRoomMembers = 0;
 
     static OrbisNpMatching2GetWorldInfoListResponse s_resp{};
     s_resp.world = &s_world;
     s_resp.worldNum = 1;
 
+    // Call the callback directly from this thread (PS4 pthread) — NOT through
+    // ScheduleEvent/DrainReadyEvents. The game's DefaultCallback (handleEvent_type2)
+    // pushes to the NXRV event queue, which must happen from a library thread
+    // context, not from the game's own surveillance dispatch loop.
     if (a->callback) {
-        PendingEvent ev{};
-        ev.type = PendingEvent::REQUEST_CB;
-        ev.fire_at = std::chrono::steady_clock::now();
-        ev.req_id = a->req_id;
-        ev.req_event = 2;
-        ev.error_code = 0;
-        ev.request_data = &s_resp;
-        ev.request_cb = a->callback;
-        ev.request_cb_arg = a->callback_arg;
-        ScheduleEvent(std::move(ev));
+        fprintf(stderr,
+                "[NpM2] GetWorldInfoList: calling callback directly ctx=%d reqId=%d "
+                "cb=%p cbArg=%p world={id=%u lobbyCount=%u maxLobbyMem=%u curLobbyMem=%u "
+                "curRooms=%u curRoomMem=%u} worldNum=%lu resp=%p world_ptr=%p\n",
+                a->ctx_id, a->req_id, (void*)a->callback, a->callback_arg,
+                s_world.worldId, s_world.lobbyCount, s_world.maxLobbyMembers,
+                s_world.curLobbyMembers, s_world.curRooms, s_world.curRoomMembers,
+                s_resp.worldNum, (void*)&s_resp, (void*)s_resp.world);
+        fflush(stderr);
+        a->callback(a->ctx_id, a->req_id,
+                    ORBIS_NP_MATCHING2_REQUEST_EVENT_GET_WORLD_INFO_LIST,
+                    0, &s_resp, a->callback_arg);
+        fprintf(stderr, "[NpM2] GetWorldInfoList: callback returned\n");
+        fflush(stderr);
     }
 
     delete a;
@@ -4510,7 +4536,8 @@ s32 PS4_SYSV_ABI sceNpMatching2GetWorldInfoList(u16 ctxId, void* reqParam, void*
         *reqId = static_cast<s32>(rid);
     }
 
-    // Launch async PS4 thread to fire callback with world data
+    // Launch async thread — callback fires on separate thread to avoid
+    // re-entrancy in the NXRV task dispatcher's event queue.
     auto* args = new AsyncGetWorldInfoArgs{ctxId, rid, callback, callback_arg};
     Kernel::PthreadT thread = nullptr;
     int ret = Kernel::posix_pthread_create(&thread, nullptr, GetWorldInfoListThreadFunc, args);

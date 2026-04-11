@@ -325,11 +325,8 @@ static s32 TickSignalingConnectionLocked(NpSignalingConnection& conn, s32 echo_e
         } else {
             conn.state = SIG_STATE_PEER_INFO_WAIT;
             conn.state_start = now;
-            // Configurable timeout (default 15s, override via env var)
-            static const int peer_info_timeout_s = [] {
-                const char* env = std::getenv("SHADPS4_PEER_INFO_TIMEOUT_S");
-                return (env && *env) ? std::atoi(env) : 15;
-            }();
+            // Firmware connection timeout: 30 seconds (0x1c9c380 us).
+            static const int peer_info_timeout_s = 30;
             conn.peer_info_deadline = now + std::chrono::seconds(peer_info_timeout_s);
             LOG_INFO(Lib_NpSignaling, "SigState: conn={} 5->6 (PEER_INFO_WAIT)", conn.conn_id);
             [[fallthrough]];
