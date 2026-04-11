@@ -1338,8 +1338,25 @@ static void HandlePollEvent(const std::string& resp) {
         auto room_id = static_cast<u64>(JsonGetInt(resp, "RoomId"));
         auto session_id = JsonGetString(resp, "SessionId");
         auto host_online_id = JsonGetString(resp, "HostOnlineId");
-        auto host_addr = JsonGetString(resp, "HostAddr");
-        auto host_port = static_cast<u16>(JsonGetInt(resp, "HostPort"));
+        auto host_addr_raw = JsonGetString(resp, "HostAddr");
+        auto host_port_raw = static_cast<u16>(JsonGetInt(resp, "HostPort"));
+        auto host_local_addr = JsonGetString(resp, "HostLocalAddr");
+        auto host_local_port = static_cast<u16>(JsonGetInt(resp, "HostLocalPort"));
+
+        // Same-NAT detection: if host's public IP matches our STUN-mapped IP,
+        // both are behind the same NAT. Use local LAN address to avoid hairpin NAT.
+        std::string our_public = GetStunMappedAddrStr();
+        bool same_nat = !our_public.empty() && our_public != "0" &&
+                        !host_local_addr.empty() && host_local_addr != "0" &&
+                        host_addr_raw == our_public;
+        auto host_addr = same_nat ? host_local_addr : host_addr_raw;
+        auto host_port = same_nat ? host_local_port : host_port_raw;
+        if (same_nat) {
+            LOG_INFO(Lib_NpMatching2,
+                     "Same-NAT detected: host '{}' public={} matches our public={} "
+                     "-- using LAN addr '{}:{}'",
+                     host_online_id, host_addr_raw, our_public, host_local_addr, host_local_port);
+        }
 
         LOG_INFO(Lib_NpMatching2,
                  "invite poll: GUEST invite! room={} session={} host='{}' "
@@ -2062,20 +2079,22 @@ static bool HandleHostPeerJoinedEvent(const MemberInfo& member, const char* sour
     }
 
     // Choose LAN or WAN address based on network topology.
-    // If both our signaling address and the peer's local address are private IPs,
-    // we're on the same LAN -- use the local address for direct connectivity.
-    // Otherwise, use the STUN-mapped address for cross-NAT traversal.
-    auto is_private_ip = [](const std::string& ip) -> bool {
-        if (ip.empty() || ip == "0")
-            return false;
-        u32 addr = ntohl(IpStringToAddr(ip));
-        return ((addr >> 24) == 10) ||     // 10.0.0.0/8
-               ((addr >> 20) == 0xAC1) ||  // 172.16.0.0/12
-               ((addr >> 16) == 0xC0A8) || // 192.168.0.0/16
-               ((addr >> 24) == 127);      // 127.0.0.0/8
-    };
-    bool use_lan = !member.local_addr.empty() && is_private_ip(g_state.signaling_addr) &&
-                   is_private_ip(member.local_addr);
+    // Same-NAT detection: if the peer's public address matches our STUN-mapped
+    // address, both peers are behind the same NAT. Most routers don't support
+    // hairpin NAT, so we must use the local LAN addresses instead.
+    // For WAN (different public IPs), use the STUN-mapped address for NAT traversal.
+    std::string our_public = GetStunMappedAddrStr();
+    bool same_nat = !our_public.empty() && our_public != "0" &&
+                    !member.local_addr.empty() && member.local_addr != "0" &&
+                    (member.addr == our_public || member.mapped_addr == our_public);
+    bool use_lan = same_nat;
+    if (use_lan) {
+        LOG_INFO(Lib_NpMatching2,
+                 "Same-NAT detected: peer '{}' public={} matches our public={} "
+                 "-- using LAN addr '{}:{}'",
+                 member.online_id, member.addr, our_public,
+                 member.local_addr, member.local_port);
+    }
     const std::string& peer_addr =
         use_lan ? member.local_addr
                 : ((!member.mapped_addr.empty() && member.mapped_addr != "0") ? member.mapped_addr
