@@ -353,6 +353,7 @@ public:
 
 private:
     // Pending OFFER queue -- SetPeerInfo pushes, signaling thread processes.
+    // Protected by mutex_ (consolidated from separate offer_queue_mutex_).
     struct PendingOffer {
         s32 ctx_id;
         s32 conn_id;
@@ -360,7 +361,6 @@ private:
         u16 peer_port;
         std::string peer_npid;
     };
-    std::mutex offer_queue_mutex_;
     std::deque<PendingOffer> offer_queue_;
 
     // Peer classification state (console vs emulator).

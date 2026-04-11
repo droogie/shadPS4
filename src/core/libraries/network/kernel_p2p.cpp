@@ -1135,7 +1135,7 @@ void KernelP2PSubsystem::StopSignalingThread() {
 
 void KernelP2PSubsystem::QueueStunOffer(s32 ctx_id, s32 conn_id, u32 peer_addr, u16 peer_port,
                                         const std::string& peer_npid) {
-    std::lock_guard lock(offer_queue_mutex_);
+    std::lock_guard lock(mutex_);
     offer_queue_.push_back({ctx_id, conn_id, peer_addr, peer_port, peer_npid});
     LOG_INFO(Lib_Net, "KernelP2P: queued STUN OFFER for conn_id={} npid='{}' (queue size={})",
              conn_id, peer_npid, offer_queue_.size());
@@ -1199,7 +1199,7 @@ void KernelP2PSubsystem::SignalingThreadFunc() {
         {
             std::deque<PendingOffer> offers;
             {
-                std::lock_guard lock(offer_queue_mutex_);
+                std::lock_guard lock(mutex_);
                 offers.swap(offer_queue_);
             }
             for (const auto& offer : offers) {

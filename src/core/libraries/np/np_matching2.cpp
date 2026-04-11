@@ -1462,8 +1462,11 @@ static void HandlePollEvent(const std::string& resp) {
                          "(P2P tunnel active, awaiting TYPE=1 from HOST)",
                          room_id, g_state.ctx.my_member_id);
 
-                // Multi-peer: start guest poll thread early
-                if (g_state.ctx.my_member_id >= 3 && !g_state.guest_poll_running) {
+                // Multi-peer: start guest poll thread early (only if WebSocket is down —
+                // when WS is active, HandlePollEvent handles all member lifecycle events).
+                bool ws_active = g_state.ws_client &&
+                    g_state.ws_client->getReadyState() == easywsclient::WebSocket::OPEN;
+                if (g_state.ctx.my_member_id >= 3 && !g_state.guest_poll_running && !ws_active) {
                     g_state.guest_poll_running = true;
                     Kernel::PthreadT gp_thread = nullptr;
                     int gp_ret = Kernel::posix_pthread_create(&gp_thread, nullptr,
@@ -3009,9 +3012,11 @@ static PS4_SYSV_ABI void* JoinRoomThreadFunc(void* arg) {
                  g_state.peers.size());
     }
 
-    // Start guest-side member polling for departure detection (Phase 2).
-    // The guest polls room_members every 2s to detect if the host disconnects.
-    if (!g_state.guest_poll_running) {
+    // Start guest-side member polling for departure detection.
+    // Only needed when WebSocket is down — WS handles room_closed/member_left events.
+    bool ws_active_join = g_state.ws_client &&
+        g_state.ws_client->getReadyState() == easywsclient::WebSocket::OPEN;
+    if (!g_state.guest_poll_running && !ws_active_join) {
         g_state.guest_poll_running = true;
         Kernel::PthreadT gp_thread = nullptr;
         int gp_ret =
