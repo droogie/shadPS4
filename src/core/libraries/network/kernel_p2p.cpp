@@ -1385,30 +1385,14 @@ void KernelP2PSubsystem::SignalingThreadFunc() {
                 to_accept.push_back({matched_conn->ctx_id, matched_conn->conn_id, relay.mapped_addr,
                                      relay.mapped_port});
             } else {
-                LOG_WARNING(Lib_Net,
-                            "KernelP2P: STUN relay -- no matching connection, "
-                            "sending speculative ACCEPT (username='{}' mapped={}:{})",
-                            relay_username, mapped_buf, ntohs(relay.mapped_port));
-                if (relay.mapped_addr != 0) {
-                    std::vector<u8> udata;
-                    if (!local_npid_.empty()) {
-                        udata.assign(local_npid_.begin(), local_npid_.end());
-                        udata.resize(16, 0);
-                    }
-                    sc->SendAccept(relay.mapped_addr, relay.mapped_port, udata, {0x03});
-
-                    struct sockaddr_in peer_sa{};
-                    peer_sa.sin_family = AF_INET;
-                    peer_sa.sin_addr.s_addr = relay.mapped_addr;
-                    peer_sa.sin_port = relay.mapped_port;
-                    u8 punch[] = {0xFF, 0xC3, 0x00, 0x00};
-                    int fd = sc->GetSocketFd();
-                    for (int i = 0; i < 2; i++) {
-                        ::sendto(fd, reinterpret_cast<const char*>(punch), sizeof(punch), 0,
-                                 reinterpret_cast<struct sockaddr*>(&peer_sa), sizeof(peer_sa));
-                        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-                    }
-                }
+                // No matching PENDING connection. This peer's STUN is already
+                // COMPLETE or no connection exists. Don't send speculative ACCEPTs
+                // — they create a ping-pong flood between peers who are already
+                // connected via echo probes.
+                LOG_DEBUG(Lib_Net,
+                          "KernelP2P: STUN relay -- no pending connection for "
+                          "username='{}' mapped={}:{} (already complete or unknown, ignoring)",
+                          relay_username, mapped_buf, ntohs(relay.mapped_port));
             }
         }
 
