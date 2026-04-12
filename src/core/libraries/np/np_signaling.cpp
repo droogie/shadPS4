@@ -387,6 +387,30 @@ static s32 TickSignalingConnectionLocked(NpSignalingConnection& conn, s32 echo_e
         break;
     }
 
+    // Watchdog: if any intermediate state (1-9) has been stuck for 30+ seconds,
+    // force-resolve. If kernel reports the peer as connected (echo bilateral),
+    // advance to ACTIVE. Otherwise, reset to IDLE so the game can retry or move on.
+    // This prevents stuck connections from blocking the game's entire NP pipeline.
+    if (conn.state > SIG_STATE_IDLE && conn.state < SIG_STATE_ACTIVE &&
+        conn.state_start != std::chrono::steady_clock::time_point{} &&
+        (now - conn.state_start) > std::chrono::seconds(30)) {
+        if (kern_echo_active) {
+            LOG_WARNING(Lib_NpSignaling,
+                        "SigState: conn={} WATCHDOG -- stuck in state {} for 30s, "
+                        "kernel reports ACTIVE -- forcing to ACTIVE (0xa)",
+                        conn.conn_id, conn.state);
+            conn.bilateral_confirmed = true;
+            return conn.conn_id; // caller fires TransitionToActive
+        } else {
+            LOG_WARNING(Lib_NpSignaling,
+                        "SigState: conn={} WATCHDOG -- stuck in state {} for 30s, "
+                        "kernel NOT active -- resetting to IDLE",
+                        conn.conn_id, conn.state);
+            conn.state = SIG_STATE_IDLE;
+            conn.state_start = now;
+        }
+    }
+
     return 0; // no transition needed
 }
 
