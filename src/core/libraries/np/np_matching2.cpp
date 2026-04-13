@@ -293,6 +293,11 @@ struct NpMatching2State {
     int last_member_count = 0;
 
     u32 next_request_id = 1;
+    // Monotonically incrementing conn_id for 0x5102 signaling callbacks.
+    // The game uses this to detect DEAD→ACTIVE transitions. Same conn = "already
+    // active, ignore." New conn = "new connection, process." Must be unique
+    // across room leave/rejoin cycles.
+    u32 next_signaling_conn_id = 1;
     std::mutex mutex;
 
     // Server URL for matching2 endpoints
@@ -710,7 +715,7 @@ void OnPeerEstablished(s32 conn_id, u16 member_id) {
     sig_ev.room_id = g_state.ctx.room_id;
     sig_ev.member_id = member_id;
     sig_ev.sig_event = ORBIS_NP_MATCHING2_SIGNALING_EVENT_ESTABLISHED;
-    sig_ev.conn_id = static_cast<u32>(member_id);
+    sig_ev.conn_id = g_state.next_signaling_conn_id++;
     ScheduleEvent(std::move(sig_ev));
 
     // 0x1105 is not fired here; it is only needed for 3rd+ member joins.
@@ -1289,7 +1294,7 @@ static void HandlePollEvent(const std::string& resp) {
                 ev.room_id = g_state.ctx.room_id;
                 ev.member_id = sig_member;
                 ev.sig_event = sig_event;
-                ev.conn_id = static_cast<u32>(sig_member);
+                ev.conn_id = g_state.next_signaling_conn_id++;
                 ScheduleEvent(std::move(ev));
             }
             handled_lifecycle_event = true;
@@ -1474,6 +1479,27 @@ static void HandlePollEvent(const std::string& resp) {
                 Libraries::Net::KernelP2PSubsystem::Instance().OnRoomJoined(
                     room_id, g_state.ctx.my_member_id);
 
+                // Register mesh peers from join response (non-self, non-HOST).
+                // This ensures KernelP2PSubsystem has peer addresses BEFORE the
+                // game's native ActivateConnection fires for mesh peers.
+                {
+                    auto mesh_members = JsonGetMemberArray(join_resp, "Members");
+                    for (const auto& mm : mesh_members) {
+                        u16 mm_mid = static_cast<u16>(mm.member_id);
+                        if (mm_mid == g_state.ctx.my_member_id || mm_mid == 1) {
+                            continue; // skip self and HOST (already registered)
+                        }
+                        if (mm.addr.empty() && mm.local_addr.empty()) {
+                            continue; // no usable address
+                        }
+                        HandleHostPeerJoinedEvent(mm, "invite_join_resp");
+                        LOG_INFO(Lib_NpMatching2,
+                                 "invite poll: mesh peer from join response "
+                                 "member={} online_id='{}' addr='{}' port={}",
+                                 mm.member_id, mm.online_id, mm.addr, mm.port);
+                    }
+                }
+
                 LOG_INFO(Lib_NpMatching2,
                          "invite poll: pre-joined room={} member={} "
                          "(P2P tunnel active, awaiting TYPE=1 from HOST)",
@@ -1559,8 +1585,40 @@ ack_event:
 
 s32 PS4_SYSV_ABI sceNpMatching2Initialize() {
     NP_LOG("API sceNpMatching2Initialize: called");
-    g_state.initialized = true;
 
+    // Full state reset on (re-)initialization. When the game returns to the
+    // main menu and re-logs in, all accumulated NP state from the previous
+    // session must be wiped. Without this, stale member_ids, conn_ids, and
+    // peer entries accumulate across sessions and eventually corrupt the
+    // game's internal connection tracking.
+    if (g_state.initialized) {
+        NP_LOG("sceNpMatching2Initialize: re-init detected -- performing full state reset");
+        g_state.StopPollThread();
+        g_state.FreeCallbackData();
+        {
+            std::lock_guard<std::mutex> plock(g_state.peers_mutex);
+            g_state.peers.clear();
+        }
+        NpSignaling::ClearConnections();
+        Libraries::Net::ClearP2PSessionState();
+        g_state.ctx = {};
+        g_state.known_member_count = 0;
+        g_state.host_self_established_fired.store(false);
+        g_state.next_request_id = 1;
+        g_state.next_signaling_conn_id = 1;
+        g_state.last_fired_req_id = 0;
+        g_state.last_fired_req_event = 0;
+        {
+            std::lock_guard<std::mutex> lock(g_state.event_queue_mutex);
+            g_state.pending_events.clear();
+        }
+        {
+            std::lock_guard<std::mutex> inv_lock(g_state.pending_guest_invite_mutex);
+            g_state.pending_guest_invite = {};
+        }
+    }
+
+    g_state.initialized = true;
     return ORBIS_OK;
 }
 
@@ -2105,6 +2163,33 @@ static bool HandleHostPeerJoinedEvent(const MemberInfo& member, const char* sour
     const u16 peer_mid = static_cast<u16>(member.member_id);
     const auto now = std::chrono::steady_clock::now();
 
+    // Detect same NpId rejoining with a new member_id (leave+rejoin cycle).
+    // The server assigns a new member_id each time, but the old entry may still
+    // exist in our peers map under the previous member_id. Clean it up to prevent
+    // stale entries from accumulating across rejoin cycles.
+    {
+        std::lock_guard<std::mutex> plock(g_state.peers_mutex);
+        u16 stale_mid = 0;
+        for (const auto& [mid, pi] : g_state.peers) {
+            if (pi.online_id == member.online_id && mid != peer_mid) {
+                stale_mid = mid;
+                break;
+            }
+        }
+        if (stale_mid != 0) {
+            LOG_WARNING(Lib_NpMatching2,
+                        "HandleHostPeerJoinedEvent: NpId '{}' rejoined with new member_id={} "
+                        "(was member_id={}) -- removing stale peers map entry only "
+                        "(kernel P2P connection preserved for reuse)",
+                        member.online_id, peer_mid, stale_mid);
+            g_state.peers.erase(stale_mid);
+            // Do NOT call RemoveConnectionByNpid or SetConnectionInactive here.
+            // The kernel P2P connection (echo probes, STUN mapping) should persist
+            // across room leave/rejoin cycles. Only the peers map member_id mapping
+            // needs updating.
+        }
+    }
+
     {
         std::lock_guard<std::mutex> plock(g_state.peers_mutex);
         auto it = g_state.peers.find(peer_mid);
@@ -2155,7 +2240,7 @@ static bool HandleHostPeerJoinedEvent(const MemberInfo& member, const char* sour
         sig_ev.room_id = g_state.ctx.room_id;
         sig_ev.member_id = g_state.ctx.my_member_id;
         sig_ev.sig_event = ORBIS_NP_MATCHING2_SIGNALING_EVENT_ESTABLISHED;
-        sig_ev.conn_id = static_cast<u32>(g_state.ctx.my_member_id);
+        sig_ev.conn_id = g_state.next_signaling_conn_id++;
         ScheduleEvent(std::move(sig_ev));
         NP_LOG("HandleHostPeerJoinedEvent: fired FIRST self Established 0x5102 (member={})",
                g_state.ctx.my_member_id);
@@ -3001,7 +3086,7 @@ static PS4_SYSV_ABI void* JoinRoomThreadFunc(void* arg) {
                 conn_ev.room_id = g_state.ctx.room_id;
                 conn_ev.member_id = static_cast<u16>(m.member_id);
                 conn_ev.sig_event = ORBIS_NP_MATCHING2_SIGNALING_EVENT_ESTABLISHED;
-                conn_ev.conn_id = static_cast<u32>(m.member_id);
+                conn_ev.conn_id = g_state.next_signaling_conn_id++;
                 ScheduleEvent(std::move(conn_ev));
                 conn_count++;
             }

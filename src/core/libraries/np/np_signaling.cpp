@@ -872,6 +872,13 @@ s32 PS4_SYSV_ABI sceNpSignalingActivateConnection(s32 ctxId, void* npId, s32* co
         auto& kernel = Libraries::Net::KernelP2PSubsystem::Instance();
         kernel.ActivatePeer(ctxId, npid_key);
 
+        // Bridge: if ActivatePeer created a PENDING conn (peer not yet in peers_ map
+        // because NpMatching2::SetPeerInfo hasn't run for mesh peers), resolve it now
+        // with the address we just obtained from the server. This breaks the
+        // chicken-and-egg deadlock where the game calls ActivateConnection before
+        // JoinRoom (which would call SetPeerInfo for mesh peers).
+        kernel.ResolvePendingPeer(npid_key, resolved_addr, resolved_port);
+
         LOG_INFO(Lib_NpSignaling,
                  "ActivateConnection[#{}]: resolved '{}' addr={:#x} port={} -- P2P activated",
                  call_num, npid_key, resolved_addr, ntohs(resolved_port));

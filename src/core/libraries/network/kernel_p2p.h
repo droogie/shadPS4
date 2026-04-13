@@ -66,6 +66,13 @@ public:
     // schedules ESTABLISHED event. Otherwise, stays PENDING until peer data arrives.
     s32 ActivatePeer(s32 ctx_id, const std::string& npid);
 
+    // Resolve a PENDING peer connection with address info from NpSignaling.
+    // Called by NpSignaling::ActivateConnection after ActivatePeer when the peer
+    // address was resolved via HTTP but wasn't in the peers_ map. Breaks the
+    // chicken-and-egg deadlock where ActivatePeer creates PENDING (no addr) because
+    // SetPeerInfo hasn't been called yet for mesh peers.
+    void ResolvePendingPeer(const std::string& npid, u32 addr, u16 port);
+
     // Deactivate a peer connection. Marks as INACTIVE but preserves the entry.
     int DeactivatePeer(s32 conn_id);
 

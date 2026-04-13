@@ -205,25 +205,16 @@ s32 KernelP2PSubsystem::ActivatePeer(s32 ctx_id, const std::string& npid) {
                         conn.last_echo_sent = {};
                     }
 
-                    bool stun_ready_ap = (conn.stun_state == StunState::COMPLETE ||
-                                          conn.stun_state == StunState::NONE ||
-                                          conn.stun_state == StunState::FAILED);
-                    if (conn.echo_bilateral && stun_ready_ap) {
-                        // Bilateral done + STUN ready -- fire immediately
+                    if (conn.echo_bilateral) {
+                        // Bilateral done -- fire immediately
                         conn.events_fired = true;
                         conn.mutual_fired = true;
                         conn.last_event_time = std::chrono::steady_clock::now();
                         deferred.push_back({ctx_id, cid, true});
                         LOG_INFO(Lib_Net,
                                  "KernelP2P: ActivatePeer EXISTING npid='{}' conn_id={} "
-                                 "echo bilateral + STUN ready -- firing ESTABLISHED now",
+                                 "echo bilateral already done -- firing ESTABLISHED now",
                                  npid, cid);
-                    } else if (conn.echo_bilateral) {
-                        // Bilateral done but STUN still pending -- defer
-                        LOG_INFO(Lib_Net,
-                                 "KernelP2P: ActivatePeer EXISTING npid='{}' conn_id={} "
-                                 "echo bilateral done but STUN={} -- deferring ESTABLISHED",
-                                 npid, cid, static_cast<int>(conn.stun_state));
                     } else {
                         LOG_INFO(Lib_Net,
                                  "KernelP2P: ActivatePeer EXISTING npid='{}' conn_id={} "
@@ -381,6 +372,109 @@ fire_deferred:
         }
     }
     return result_cid;
+}
+
+void KernelP2PSubsystem::ResolvePendingPeer(const std::string& npid, u32 addr, u16 port) {
+    if (npid.empty() || addr == 0) {
+        return;
+    }
+
+    struct DeferredStun {
+        s32 ctx_id;
+        s32 conn_id;
+        bool needs_stun;
+        bool i_send_offer;
+    };
+    std::vector<DeferredStun> deferred;
+
+    {
+        std::lock_guard lock(mutex_);
+
+        auto conn_it = npid_to_conn_.find(npid);
+        if (conn_it == npid_to_conn_.end()) {
+            return;
+        }
+
+        auto& conn = connections_[conn_it->second];
+
+        // Only resolve PENDING connections with no address — if already resolved
+        // (by SetPeerInfo or a prior call), this is a no-op.
+        if (conn.state != ConnState::PENDING || conn.addr != 0) {
+            return;
+        }
+
+        conn.addr = addr;
+        conn.port = port;
+
+        // Determine STUN gating — mirrors SetPeerInfo logic (lines 744-806).
+        bool is_self = (!local_npid_.empty() && npid == local_npid_);
+        auto* sc = stun_client_.load();
+        bool stun_usable = (sc != nullptr && sc->GetMappedAddr() != 0);
+        bool needs_stun = (stun_usable && !is_self);
+
+        // Look up peer member_id from peers_ map for STUN role determination.
+        // May be 0 if SetPeerInfo hasn't populated peers_ yet.
+        u16 peer_member_id = 0;
+        for (const auto& [mid, pi] : peers_) {
+            if (pi.npid == npid) {
+                peer_member_id = mid;
+                break;
+            }
+        }
+
+        if (needs_stun && (my_member_id_ == 1 || peer_member_id == 1)) {
+            // HOST<->GUEST STUN exchange
+            SetConnState(conn, ConnState::ACTIVE);
+            conn.stun_state = StunState::PENDING;
+            conn.events_fired = false;
+            conn.echo_started = true;
+            conn.last_echo_sent = {};
+            LOG_INFO(Lib_Net,
+                     "KernelP2P: ResolvePendingPeer '{}' -> conn_id={} addr={:#x} port={} "
+                     "(STUN-gated, HOST<->GUEST)",
+                     npid, conn.conn_id, addr, ntohs(port));
+            deferred.push_back({conn.ctx_id, conn.conn_id, true, my_member_id_ == 1});
+        } else if (needs_stun && peer_member_id > 0) {
+            // Mesh peer STUN: higher member_id sends OFFER
+            bool i_send_offer = (my_member_id_ > peer_member_id);
+            SetConnState(conn, ConnState::ACTIVE);
+            conn.stun_state = StunState::PENDING;
+            conn.events_fired = false;
+            conn.echo_started = true;
+            conn.last_echo_sent = {};
+            LOG_INFO(Lib_Net,
+                     "KernelP2P: ResolvePendingPeer mesh '{}' -> conn_id={} addr={:#x} port={} "
+                     "(STUN PENDING, role={}, my_member={} peer_member={})",
+                     npid, conn.conn_id, addr, ntohs(port),
+                     i_send_offer ? "OFFER" : "WAIT", my_member_id_, peer_member_id);
+            deferred.push_back({conn.ctx_id, conn.conn_id, true, i_send_offer});
+        } else {
+            // LAN / no STUN / unknown member: start echo probes directly
+            SetConnState(conn, ConnState::ACTIVE);
+            conn.stun_state = StunState::NONE;
+            conn.events_fired = false;
+            conn.echo_started = true;
+            conn.last_echo_sent = {};
+            LOG_INFO(Lib_Net,
+                     "KernelP2P: ResolvePendingPeer '{}' -> conn_id={} addr={:#x} "
+                     "({}.{}.{}.{}) port={} (ACTIVE, echo probes started)",
+                     npid, conn.conn_id, addr, (ntohl(addr) >> 24) & 0xff,
+                     (ntohl(addr) >> 16) & 0xff, (ntohl(addr) >> 8) & 0xff,
+                     ntohl(addr) & 0xff, ntohs(port));
+        }
+    } // lock released
+
+    // Queue STUN offers outside lock
+    for (const auto& ev : deferred) {
+        if (ev.needs_stun && ev.i_send_offer) {
+            QueueStunOffer(ev.ctx_id, ev.conn_id, addr, port, npid);
+        } else if (ev.needs_stun) {
+            LOG_INFO(Lib_Net,
+                     "KernelP2P: ResolvePendingPeer WAIT role -- expecting OFFER "
+                     "for conn_id={} npid='{}' (no outbound OFFER)",
+                     ev.conn_id, npid);
+        }
+    }
 }
 
 int KernelP2PSubsystem::DeactivatePeer(s32 conn_id) {
@@ -1311,11 +1405,14 @@ void KernelP2PSubsystem::SignalingThreadFunc() {
             PeerConnection* matched_conn = nullptr;
 
             // Strategy 1: Match by USERNAME -> NpId
+            // Only match STUN PENDING connections — once COMPLETE, stop processing
+            // relay responses. The !events_fired check was causing an infinite
+            // OFFER/ACCEPT loop when game_activated deferred ESTABLISHED.
             if (!relay_username.empty()) {
                 auto conn_it = npid_to_conn_.find(relay_username);
                 if (conn_it != npid_to_conn_.end()) {
                     auto& conn = connections_[conn_it->second];
-                    if (conn.stun_state == StunState::PENDING || !conn.events_fired) {
+                    if (conn.stun_state == StunState::PENDING) {
                         matched_conn = &conn;
                         LOG_INFO(Lib_Net,
                                  "KernelP2P: STUN relay matched by USERNAME='{}' -> conn_id={}",
@@ -1328,7 +1425,7 @@ void KernelP2PSubsystem::SignalingThreadFunc() {
             if (!matched_conn) {
                 for (auto& [cid, conn] : connections_) {
                     if (conn.addr == relay.mapped_addr && conn.port == relay.mapped_port &&
-                        (conn.stun_state == StunState::PENDING || !conn.events_fired)) {
+                        conn.stun_state == StunState::PENDING) {
                         matched_conn = &conn;
                         LOG_INFO(Lib_Net,
                                  "KernelP2P: STUN relay matched by address {}:{} -> conn_id={}",
@@ -1375,9 +1472,6 @@ void KernelP2PSubsystem::SignalingThreadFunc() {
                              matched_conn->conn_id);
                 }
 
-                // Fire ESTABLISHED only when ALL three conditions are met:
-                // game_activated + echo_bilateral + STUN ready.
-                // This ensures both the P2P tunnel AND the game are ready.
                 // Event firing is handled by the ACCEPT handler below
                 // (checks game_activated + echo_bilateral + !events_fired).
                 // Just queue the ACCEPT here.
@@ -1875,22 +1969,19 @@ void KernelP2PSubsystem::ProcessEchoProbe(u32 from_addr, u16 from_port, const u8
                             conn.echo_bilateral = true;
                             SetConnState(conn, ConnState::ACTIVE);
 
-                            // Event-driven: only fire ESTABLISHED when BOTH conditions met:
-                            // 1. game_activated = true (game called ActivateConnection)
-                            // 2. STUN is ready (COMPLETE or NONE, not PENDING)
-                            // This prevents the race where ESTABLISHED fires before the
-                            // P2P tunnel is fully set up (especially on WAN where STUN
-                            // takes 100-500ms). ActivatePeer will fire when both are ready.
-                            bool stun_ready = (conn.stun_state == StunState::COMPLETE ||
-                                               conn.stun_state == StunState::NONE ||
-                                               conn.stun_state == StunState::FAILED);
-                            if (!conn.game_activated || !stun_ready) {
+                            // Event-driven: only fire ESTABLISHED if the game has
+                            // already called ActivateConnection (game_activated=true).
+                            // If not, defer — ActivatePeer will fire it when the game
+                            // is ready. This prevents the race where ESTABLISHED arrives
+                            // before the game's SocketState/P2P transport is set up.
+                            // NOTE: STUN readiness is NOT checked here — echo bilateral
+                            // already confirms P2P connectivity regardless of STUN state.
+                            if (!conn.game_activated) {
                                 LOG_INFO(Lib_Net,
                                          "KernelP2P: echo bilateral confirmed for conn_id={} "
-                                         "npid='{}' -- DEFERRED (game_activated={} stun={}, "
-                                         "will fire when both ready)",
-                                         cid, conn.npid, conn.game_activated,
-                                         static_cast<int>(conn.stun_state));
+                                         "npid='{}' -- DEFERRED (game not activated yet, "
+                                         "will fire on ActivatePeer)",
+                                         cid, conn.npid);
                             } else {
                             conn.events_fired = true;
                             conn.mutual_fired = true;
