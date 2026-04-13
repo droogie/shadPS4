@@ -406,11 +406,19 @@ void KernelP2PSubsystem::ResolvePendingPeer(const std::string& npid, u32 addr, u
         conn.addr = addr;
         conn.port = port;
 
-        // Determine STUN gating — mirrors SetPeerInfo logic (lines 744-806).
+        // Determine STUN gating — mirrors SetPeerInfo logic.
         bool is_self = (!local_npid_.empty() && npid == local_npid_);
         auto* sc = stun_client_.load();
         bool stun_usable = (sc != nullptr && sc->GetMappedAddr() != 0);
-        bool needs_stun = (stun_usable && !is_self);
+
+        // LAN detection: skip STUN when both sides on same private network
+        auto is_private = [](u32 nbo_addr) -> bool {
+            u32 h = ntohl(nbo_addr);
+            return ((h >> 24) == 10) || ((h >> 20) == 0xAC1) ||
+                   ((h >> 16) == 0xC0A8) || ((h >> 24) == 127);
+        };
+        bool same_lan = is_private(local_addr_) && is_private(addr);
+        bool needs_stun = (stun_usable && !is_self && !same_lan);
 
         // Look up peer member_id from peers_ map for STUN role determination.
         // May be 0 if SetPeerInfo hasn't populated peers_ yet.
@@ -845,15 +853,21 @@ void KernelP2PSubsystem::SetPeerInfo(u16 member_id, u32 addr, u16 port, const st
                     conn.port = port;
 
                     // Determine if STUN exchange should gate ESTABLISHED events.
-                    // Always attempt STUN for non-self peers when a STUN client is
-                    // available. Private (RFC 1918) addresses do NOT imply same-LAN
-                    // reachability — cross-network peers may report their LAN IP if
-                    // their client hasn't completed NAT probing. Echo probes run in
-                    // parallel with STUN, so LAN peers still get the fast path
-                    // (direct echo bilateral confirms before STUN finishes).
+                    // Skip STUN entirely when both local and peer addresses are on the
+                    // same private subnet — direct echo probes confirm connectivity
+                    // immediately on LAN without relay involvement. On a real PS4, LAN
+                    // connections bypass STUN/NAT traversal entirely.
                     auto* sc_spi = stun_client_.load();
                     bool stun_usable = (sc_spi != nullptr && sc_spi->GetMappedAddr() != 0);
-                    bool needs_stun = (stun_usable && !is_self);
+
+                    // LAN detection: both sides on same private network → skip STUN
+                    auto is_private = [](u32 nbo_addr) -> bool {
+                        u32 h = ntohl(nbo_addr);
+                        return ((h >> 24) == 10) || ((h >> 20) == 0xAC1) ||
+                               ((h >> 16) == 0xC0A8) || ((h >> 24) == 127);
+                    };
+                    bool same_lan = is_private(local_addr_) && is_private(addr);
+                    bool needs_stun = (stun_usable && !is_self && !same_lan);
 
                     if (needs_stun && (my_member_id_ == 1 || member_id == 1)) {
                         // HOST<->GUEST STUN exchange: gate ESTABLISHED until

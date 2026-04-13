@@ -331,10 +331,11 @@ struct SharedTransport {
                 continue;
             }
 
-            // Echo probes: [FF 83 FF FD ...] -- detect by raw bytes before vport parsing.
-            // flags=0x83, followed by FF FD which are the 1-byte src/dst vport values.
-            // The kernel treats these identically to any other vport packet.
-            if (n >= 4 && buf[2] == 0xFF && buf[3] == 0xFD) {
+            // Echo probes: [FF 83 FF FD/FE ...] -- detect by raw bytes before vport parsing.
+            // VP40 echo uses vport 0xFFFD (65533), VP30 echo uses vport 0xFFFE (65534).
+            // On real PS4, the kernel handles both echo vports. Without 0xFFFE handling,
+            // VP30 echo probes are silently dropped and VP30 stays in HELLO retransmission.
+            if (n >= 4 && buf[2] == 0xFF && (buf[3] == 0xFD || buf[3] == 0xFE)) {
                 // Strip the 4-byte wire header, pass payload to echo handler
                 LOG_INFO(Lib_Net, "P2P Drain: echo probe detected! {} bytes from {:#x}:{}", n,
                          ntohl(from.sin_addr.s_addr), ntohs(from.sin_port));
