@@ -114,7 +114,10 @@ public:
     // Wait for an incoming STUN response (from a peer's OFFER/ACCEPT relay).
     // Listens on the same socket used for SendBinding.
     // Returns parsed result, or failure after timeout.
-    StunBindingResult WaitForRelay(u32 timeout_ms = 3000);
+    // If expected_username is non-empty, only returns responses matching that
+    // peer's USERNAME — non-matching responses are re-queued for other callers.
+    StunBindingResult WaitForRelay(u32 timeout_ms = 3000,
+                                   const std::string& expected_username = "");
 
     // Get the last known mapped address (from most recent probe/binding).
     u32 GetMappedAddr() const;

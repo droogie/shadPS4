@@ -2113,20 +2113,10 @@ void KernelP2PSubsystem::ProcessStunOffer(s32 ctx_id, s32 conn_id, u32 peer_addr
                  "waiting for ACCEPT (2s timeout)",
                  mapped_buf, ntohs(result.mapped_port));
 
-        // Short timeout -- the signaling thread's main loop will catch the
-        // ACCEPT as an incoming relay if we miss it here.
-        auto accept = sc_offer->WaitForRelay(500);
-
-        // Validate STUN response matches the expected peer before accepting.
-        // On same-NAT, multiple peers share an IP — the relay can return the
-        // wrong peer's response. Check USERNAME (peer NpId) if available.
-        if (accept.success && !accept.username.empty() && accept.username != peer_npid) {
-            LOG_WARNING(Lib_Net,
-                        "KernelP2P: STUN ACCEPT username mismatch for conn_id={}: "
-                        "expected='{}' got='{}' -- ignoring stale relay response",
-                        conn_id, peer_npid, accept.username);
-            accept.success = false;
-        }
+        // Wait for ACCEPT from the specific peer we sent the OFFER to.
+        // WaitForRelay filters by expected_username — non-matching responses
+        // (from other peers' ACCEPTs) stay in the queue for their own handlers.
+        auto accept = sc_offer->WaitForRelay(500, peer_npid);
 
         // Update connection state under lock, then send NAT punch outside lock
         // (sendto + sleep_for while holding mutex_ starves other threads for ~100ms).

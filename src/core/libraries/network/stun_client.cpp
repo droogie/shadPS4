@@ -957,31 +957,59 @@ StunBindingResult StunClient::SendAccept(u32 peer_addr, u16 peer_port,
     return result;
 }
 
-StunBindingResult StunClient::WaitForRelay(u32 timeout_ms) {
+StunBindingResult StunClient::WaitForRelay(u32 timeout_ms, const std::string& expected_username) {
     if (shutting_down_.load())
         return {};
 
-    // With txn-id routing, relay_queue_ receives ONLY unsolicited STUN
-    // responses with USERNAME (incoming OFFER/ACCEPT from peers).
-    // No dual-path socket reading needed -- PushReceivedPacket handles routing.
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+
     std::unique_lock lock(relay_mutex_);
-    if (relay_cv_.wait_for(lock, std::chrono::milliseconds(timeout_ms),
-                           [this] { return !relay_queue_.empty() || shutting_down_.load(); })) {
+    while (!shutting_down_.load()) {
+        // Wait for any item in the queue (or timeout)
+        if (!relay_cv_.wait_until(lock, deadline,
+                                  [this] { return !relay_queue_.empty() || shutting_down_.load(); })) {
+            return {}; // timeout
+        }
         if (shutting_down_.load())
             return {};
-        auto msg = std::move(relay_queue_.front());
-        relay_queue_.pop_front();
-        lock.unlock();
 
-        // Parse with the packet's own txn_id (relaxed -- we accept any txn for relays)
-        u8 any_txn[16] = {};
-        if (msg.data.size() >= STUN_HEADER_SIZE) {
-            std::memcpy(any_txn, msg.data.data() + 4, 16);
+        // If no filter, take the first item (original behavior)
+        if (expected_username.empty()) {
+            auto msg = std::move(relay_queue_.front());
+            relay_queue_.pop_front();
+            lock.unlock();
+            u8 any_txn[16] = {};
+            if (msg.data.size() >= STUN_HEADER_SIZE) {
+                std::memcpy(any_txn, msg.data.data() + 4, 16);
+            }
+            std::string relay_username;
+            auto result =
+                ParseResponse(msg.data.data(), msg.data.size(), any_txn, &relay_username);
+            result.username = std::move(relay_username);
+            return result;
         }
-        std::string relay_username;
-        auto result = ParseResponse(msg.data.data(), msg.data.size(), any_txn, &relay_username);
-        result.username = std::move(relay_username);
-        return result;
+
+        // With filter: scan the queue for a matching USERNAME.
+        // Non-matching items stay in the queue for other callers.
+        for (auto it = relay_queue_.begin(); it != relay_queue_.end(); ++it) {
+            // Pre-parse USERNAME from the queued message to check before consuming.
+            // USERNAME is in the QueuedMsg.username field (extracted by PushReceivedPacket).
+            if (it->username == expected_username) {
+                auto msg = std::move(*it);
+                relay_queue_.erase(it);
+                lock.unlock();
+                u8 any_txn[16] = {};
+                if (msg.data.size() >= STUN_HEADER_SIZE) {
+                    std::memcpy(any_txn, msg.data.data() + 4, 16);
+                }
+                std::string relay_username;
+                auto result =
+                    ParseResponse(msg.data.data(), msg.data.size(), any_txn, &relay_username);
+                result.username = std::move(relay_username);
+                return result;
+            }
+        }
+        // No matching item yet — keep waiting until deadline
     }
     return {};
 }
