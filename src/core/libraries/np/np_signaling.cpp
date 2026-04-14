@@ -538,20 +538,24 @@ static void KernelEventBridge(s32 ctx_id, s32 conn_id, s32 event, u32 delay_ms) 
                 for (auto& [cid, conn] : s_sig_connections) {
                     if (conn.npid == event_npid) {
                         sig_conn_id = cid;
-                        // Reset stale non-ACTIVE connections so the state machine
-                        // can process ESTABLISHED
-                        if (conn.state != SIG_STATE_ACTIVE) {
-                            conn.state = SIG_STATE_PENDING;
-                            conn.state_start = std::chrono::steady_clock::now();
-                            conn.has_peer_info = true;
-                            conn.bilateral_confirmed = true;
-                            conn.stun_completed = true;
-                            conn.server_confirmed = true;
-                            LOG_INFO(Lib_NpSignaling,
-                                     "KernelEventBridge: reset stale sig conn={} "
-                                     "npid='{}' state->PENDING for ESTABLISHED delivery",
-                                     cid, event_npid);
-                        }
+                        // The kernel conn_id doesn't match the sig conn_id —
+                        // this is a NEW connection for the same npid (peer
+                        // re-joined a room). Reset the state machine so
+                        // ESTABLISHED can be re-processed and callbacks re-fire.
+                        // Without this, a stale ACTIVE state from a previous
+                        // session blocks OnPeerEstablished, preventing the HOST
+                        // from sending TYPE=1 to the GUEST.
+                        conn.state = SIG_STATE_PENDING;
+                        conn.state_start = std::chrono::steady_clock::now();
+                        conn.has_peer_info = true;
+                        conn.bilateral_confirmed = true;
+                        conn.stun_completed = true;
+                        conn.server_confirmed = true;
+                        LOG_INFO(Lib_NpSignaling,
+                                 "KernelEventBridge: reset sig conn={} npid='{}' "
+                                 "(was state={}) -> PENDING for new kernel conn={}",
+                                 cid, event_npid, static_cast<int>(conn.state),
+                                 conn_id);
                         break;
                     }
                 }
@@ -812,21 +816,23 @@ s32 PS4_SYSV_ABI sceNpSignalingActivateConnection(s32 ctxId, void* npId, s32* co
         for (auto& [id, conn] : s_sig_connections) {
             if (conn.npid == npid_key) {
                 cid = id;
-                // Reset non-ACTIVE stale connection to prevent state machine stalls.
-                if (conn.state != SIG_STATE_ACTIVE) {
-                    conn.state = SIG_STATE_PENDING;
-                    conn.state_start = std::chrono::steady_clock::now();
-                    conn.ctx_id = ctxId;
-                    conn.has_peer_info = false;
-                    conn.bilateral_confirmed = false;
-                    conn.stun_completed = false;
-                    conn.server_confirmed = false;
-                    conn.peer_addr = 0;
-                    conn.peer_port = 0;
-                    LOG_INFO(Lib_NpSignaling,
-                             "ActivateConnection: reset stale conn_id={} npid='{}' -> PENDING", cid,
-                             npid_key);
-                }
+                // Always reset to PENDING on re-activation. Without this,
+                // a stale ACTIVE state from a previous session prevents
+                // ESTABLISHED from being re-processed (KernelEventBridge
+                // skips ACTIVE connections → OnPeerEstablished never fires).
+                LOG_INFO(Lib_NpSignaling,
+                         "ActivateConnection: reset conn_id={} npid='{}' "
+                         "(was state={}) -> PENDING",
+                         cid, npid_key, static_cast<int>(conn.state));
+                conn.state = SIG_STATE_PENDING;
+                conn.state_start = std::chrono::steady_clock::now();
+                conn.ctx_id = ctxId;
+                conn.has_peer_info = false;
+                conn.bilateral_confirmed = false;
+                conn.stun_completed = false;
+                conn.server_confirmed = false;
+                conn.peer_addr = 0;
+                conn.peer_port = 0;
                 break;
             }
         }
