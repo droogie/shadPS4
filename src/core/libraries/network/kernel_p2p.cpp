@@ -557,16 +557,12 @@ int KernelP2PSubsystem::GetConnectionStatus(s32 conn_id, s32* status_out, u32* a
     if (it != connections_.end()) {
         const auto& conn = it->second;
 
-        // State read with GCS gate: ACTIVE connections report PENDING until
-        // ESTABLISHED has been fired (events_fired=true). This prevents the
-        // game's SocketState pipeline from reading ACTIVE before the signaling
-        // pipeline has populated SigDataManager. Without this gate, the
-        // pipeline takes a wrong branch and skips ConnObj setup.
+        // Firmware behavior (sub_404640): immediate state read, no gates.
         s32 status;
         if (conn.state == ConnState::INACTIVE) {
             status = CONN_STATUS_INACTIVE;
         } else if (conn.state == ConnState::ACTIVE) {
-            status = conn.events_fired ? CONN_STATUS_ACTIVE : CONN_STATUS_PENDING;
+            status = CONN_STATUS_ACTIVE;
         } else {
             status = CONN_STATUS_PENDING;
         }

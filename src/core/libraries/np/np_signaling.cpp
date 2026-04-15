@@ -265,10 +265,7 @@ static KernelEchoState QueryKernelEchoState(const std::string& npid) {
     if (kern_cid > 0) {
         s32 kern_status = 0;
         kernel.GetConnectionStatus(kern_cid, &kern_status, &result.addr, &result.port);
-        // ConnState::ACTIVE means addr/port known (set early in SetPeerInfo).
-        // IsEchoBilateral checks actual UDP echo confirmation -- the true P2P
-        // connectivity indicator needed for NAT punch-through over the internet.
-        result.active = kernel.IsEchoBilateral(npid);
+        result.active = (kern_status == 2); // ACTIVE = addr/port known
     }
     return result;
 }
@@ -848,23 +845,27 @@ s32 PS4_SYSV_ABI sceNpSignalingActivateConnection(s32 ctxId, void* npId, s32* co
         for (auto& [id, conn] : s_sig_connections) {
             if (conn.npid == npid_key) {
                 cid = id;
-                // Always reset to PENDING on re-activation. Without this,
-                // a stale ACTIVE state from a previous session prevents
-                // ESTABLISHED from being re-processed (KernelEventBridge
-                // skips ACTIVE connections → OnPeerEstablished never fires).
-                LOG_INFO(Lib_NpSignaling,
-                         "ActivateConnection: reset conn_id={} npid='{}' "
-                         "(was state={}) -> PENDING",
-                         cid, npid_key, static_cast<int>(conn.state));
-                conn.state = SIG_STATE_PENDING;
-                conn.state_start = std::chrono::steady_clock::now();
-                conn.ctx_id = ctxId;
-                conn.has_peer_info = false;
-                conn.bilateral_confirmed = false;
-                conn.stun_completed = false;
-                conn.server_confirmed = false;
-                conn.peer_addr = 0;
-                conn.peer_port = 0;
+                // Only reset non-ACTIVE connections. The game calls
+                // ActivateConnection multiple times per peer during
+                // multi-player ConnObj setup. Resetting an ACTIVE
+                // connection destroys a working P2P link and the
+                // subsequent resolve often fails (LeaveRoom already
+                // cleared peer data), killing the third player's session.
+                if (conn.state != SIG_STATE_ACTIVE) {
+                    LOG_INFO(Lib_NpSignaling,
+                             "ActivateConnection: reset conn_id={} npid='{}' "
+                             "(was state={}) -> PENDING",
+                             cid, npid_key, static_cast<int>(conn.state));
+                    conn.state = SIG_STATE_PENDING;
+                    conn.state_start = std::chrono::steady_clock::now();
+                    conn.ctx_id = ctxId;
+                    conn.has_peer_info = false;
+                    conn.bilateral_confirmed = false;
+                    conn.stun_completed = false;
+                    conn.server_confirmed = false;
+                    conn.peer_addr = 0;
+                    conn.peer_port = 0;
+                }
                 break;
             }
         }
