@@ -1571,14 +1571,20 @@ void KernelP2PSubsystem::SignalingThreadFunc() {
             // ActivateConnection. This prevents premature ESTABLISHED firing during the
             // invite poll phase (before JoinRoom/ActivateConnection), which causes the
             // SCO to receive ESTABLISHED for an unknown connId -> teardown -> broken session.
+            // STUN ACCEPT confirms both sides exchanged relay requests — NAT
+            // mappings exist. Fire ESTABLISHED on game_activated alone (no echo
+            // bilateral required). On WAN, echo bilateral can take 30+ seconds
+            // while the NAT mapping stabilizes. Requiring it here caused the HOST
+            // to timeout and fire DEAD before TYPE=1 could be sent to the GUEST.
             bool should_fire = false;
             {
                 std::lock_guard lock(mutex_);
                 auto it = connections_.find(ev.conn_id);
                 if (it != connections_.end() && it->second.game_activated &&
-                    it->second.echo_bilateral && !it->second.events_fired) {
+                    !it->second.events_fired) {
                     it->second.events_fired = true;
                     it->second.mutual_fired = true;
+                    it->second.echo_bilateral = true; // STUN confirms connectivity
                     it->second.last_event_time = std::chrono::steady_clock::now();
                     should_fire = true;
                 }
@@ -1589,7 +1595,7 @@ void KernelP2PSubsystem::SignalingThreadFunc() {
             } else {
                 LOG_INFO(Lib_Net,
                          "KernelP2P: STUN ACCEPT sent for conn_id={} -- not all conditions met "
-                         "for ESTABLISHED (game/bilateral/stun will converge)",
+                         "for ESTABLISHED (game not activated yet, will converge)",
                          ev.conn_id);
             }
         }
