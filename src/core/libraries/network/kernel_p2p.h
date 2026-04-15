@@ -292,6 +292,8 @@ private:
         int echo_probes_sent{0};        // total probes sent
         int echo_responses_received{0}; // responses from peer
         bool echo_bilateral{false};     // bilateral confirmation achieved (>= 3 responses)
+        bool data_phase_active{false};  // DATA exchange delay active (GUEST late-joiners)
+        std::chrono::steady_clock::time_point data_phase_start{};
         std::chrono::steady_clock::time_point last_echo_sent{};
         std::chrono::steady_clock::time_point echo_start_at{}; // when probing began
         s32 rtt_us{0};        // measured round-trip time in microseconds

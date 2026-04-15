@@ -511,6 +511,7 @@ int KernelP2PSubsystem::DeactivatePeer(s32 conn_id) {
             // Full reset of echo/signaling state so re-activation starts fresh.
             it->second.echo_started = false;
             it->second.echo_bilateral = false;
+            it->second.data_phase_active = false;
             it->second.game_activated = false;
             it->second.echo_probes_sent = 0;
             it->second.echo_responses_received = 0;
@@ -1617,8 +1618,7 @@ static constexpr u8 ECHO_TYPE_RESPONSE = 0x07;
 //   Phase 2 (LAN only): DATA exchange delay before ESTABLISHED, giving the game
 //     time to create SocketState entries for 3+ player sessions.
 //   STUN connections skip Phase 2.
-// Firmware timing: 200ms main callout tick (sceNpCalloutStartOnCtx 0x30d40 us).
-static constexpr auto ECHO_PROBE_INTERVAL = std::chrono::milliseconds(200);
+static constexpr auto ECHO_PROBE_INTERVAL = std::chrono::milliseconds(500);
 // 10-second keepalive after ESTABLISHED. More aggressive than firmware (60s)
 // but needed for WAN: consumer NATs often have 30-40s UDP idle timeouts,
 // and a 60s gap causes the NAT mapping to expire silently.
@@ -1626,8 +1626,12 @@ static constexpr auto ECHO_KEEPALIVE_INTERVAL = std::chrono::seconds(10);
 static constexpr int ECHO_PROBES_FOR_ESTABLISHED = 3;
 
 // DATA exchange phase duration (GUEST/INVADER LAN only, late-joiners).
-// DATA_EXCHANGE_DURATION removed: firmware has no such mechanism.
-// ESTABLISHED fires immediately when bilateral confirmation is achieved.
+// Configurable via SHADPS4_DATA_EXCHANGE_MS environment variable.
+// Set to 0 to disable (instant ESTABLISHED after bilateral, old behavior).
+static const auto DATA_EXCHANGE_DURATION = std::chrono::milliseconds([] {
+    const char* env = std::getenv("SHADPS4_DATA_EXCHANGE_MS");
+    return (env && *env) ? std::atoi(env) : 2000;
+}());
 
 void KernelP2PSubsystem::SendEchoProbes() {
     // Collect connections that need probes
@@ -1698,23 +1702,10 @@ void KernelP2PSubsystem::SendEchoProbes() {
 
             auto now = std::chrono::steady_clock::now();
 
-            // Echo fallback: if echo probes haven't gotten bilateral confirmation
-            // after a delay, decide based on whether any echo responses arrived:
-            // - resp > 0: peer is reachable but bilateral threshold not met -> fire ESTABLISHED
-            // - resp == 0: peer is genuinely unreachable -> fire DEAD so the game
-            //   can move on to the next candidate (prevents stuck matchmaking)
-            //
-            // With port-based relay (--relay), all peers connect through relay
-            // server virtual ports -- echo probes succeed naturally via the relay.
-            // This fallback only matters for STUN-only mode where direct P2P fails.
-            // Firmware connection timeout: 30 seconds (0x1c9c380 us).
-            // If no bilateral confirmation within this window, fire DEAD.
+            static constexpr auto STUN_FALLBACK_DELAY = std::chrono::milliseconds(3500);
             static constexpr auto CONNECTION_TIMEOUT = std::chrono::seconds(30);
 
             // Timeout for PENDING connections with no address (peer never joined room).
-            // The game can call ActivateConnection for peers that aren't reachable
-            // (e.g., left before joining). Without this, the connection sits as a
-            // zombie (addr=0, echo_started=false) forever.
             if (conn.state == ConnState::PENDING && conn.addr == 0 && conn.game_activated &&
                 !conn.events_fired) {
                 if (conn.state_changed_at != std::chrono::steady_clock::time_point{} &&
@@ -1729,12 +1720,29 @@ void KernelP2PSubsystem::SendEchoProbes() {
                 }
             }
 
+            // DATA exchange phase timer: fires ESTABLISHED after delay
+            if (conn.data_phase_active && conn.echo_bilateral && conn.game_activated) {
+                auto elapsed = now - conn.data_phase_start;
+                if (elapsed >= DATA_EXCHANGE_DURATION) {
+                    conn.data_phase_active = false;
+                    conn.events_fired = true;
+                    conn.mutual_fired = true;
+                    conn.last_event_time = now;
+                    echo_fire_deferred.push_back({conn.ctx_id, cid});
+                    LOG_INFO(Lib_Net,
+                             "KernelP2P: DATA exchange timer complete for conn_id={} "
+                             "npid='{}' ({}ms elapsed) -- firing ESTABLISHED + MUTUAL",
+                             cid, conn.npid,
+                             std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count());
+                }
+            }
+
+            // Echo fallback: 3.5s timeout for bilateral confirmation.
             if (conn.echo_started && !conn.events_fired && !conn.echo_bilateral &&
-                conn.game_activated) {
+                !conn.data_phase_active && conn.game_activated) {
                 if (conn.echo_start_at == std::chrono::steady_clock::time_point{}) {
                     conn.echo_start_at = now;
-                } else if ((now - conn.echo_start_at) >= CONNECTION_TIMEOUT) {
-                    // Firmware 30-second connection timeout expired.
+                } else if ((now - conn.echo_start_at) >= STUN_FALLBACK_DELAY) {
                     if (conn.echo_responses_received > 0) {
                         // Got some responses -- peer reachable, fire ESTABLISHED
                         conn.events_fired = true;
@@ -1742,7 +1750,7 @@ void KernelP2PSubsystem::SendEchoProbes() {
                         conn.last_event_time = now;
                         echo_fire_deferred.push_back({conn.ctx_id, cid});
                         LOG_INFO(Lib_Net,
-                                 "KernelP2P: timeout fallback -- partial echo for conn_id={} "
+                                 "KernelP2P: STUN fallback -- partial echo for conn_id={} "
                                  "npid='{}' after {}ms -- firing ESTABLISHED "
                                  "(probes_sent={} resp={})",
                                  cid, conn.npid,
@@ -1751,7 +1759,7 @@ void KernelP2PSubsystem::SendEchoProbes() {
                                      .count(),
                                  conn.echo_probes_sent, conn.echo_responses_received);
                     } else {
-                        // Zero responses -- peer genuinely unreachable, fire DEAD
+                        // Zero responses -- peer unreachable, fire DEAD
                         SetConnState(conn, ConnState::INACTIVE);
                         conn.echo_started = false;
                         conn.events_fired = false;
@@ -1759,7 +1767,7 @@ void KernelP2PSubsystem::SendEchoProbes() {
                         LOG_WARNING(Lib_Net,
                                     "KernelP2P: peer UNREACHABLE -- conn_id={} npid='{}' "
                                     "after {}ms, 0 echo responses (probes_sent={}) -- "
-                                    "firing DEAD (30s firmware timeout)",
+                                    "firing DEAD",
                                     cid, conn.npid,
                                     std::chrono::duration_cast<std::chrono::milliseconds>(
                                         now - conn.echo_start_at)
@@ -1997,33 +2005,70 @@ void KernelP2PSubsystem::ProcessEchoProbe(u32 from_addr, u16 from_port, const u8
                             conn.echo_bilateral = true;
                             SetConnState(conn, ConnState::ACTIVE);
 
-                            // Event-driven: only fire ESTABLISHED if the game has
-                            // already called ActivateConnection (game_activated=true).
-                            // If not, defer — ActivatePeer will fire it when the game
-                            // is ready. This prevents the race where ESTABLISHED arrives
-                            // before the game's SocketState/P2P transport is set up.
-                            // NOTE: STUN readiness is NOT checked here — echo bilateral
-                            // already confirms P2P connectivity regardless of STUN state.
+                            // Delay ESTABLISHED for GUEST late-joiners so the game
+                            // has time to create SocketState entries. HOST always fires
+                            // immediately (needs to send TYPE=1 sessionReady promptly).
+                            bool should_delay = false;
+                            if (DATA_EXCHANGE_DURATION.count() > 0 && my_member_id_ != 1) {
+                                if (conn.stun_state != StunState::NONE) {
+                                    should_delay = true;
+                                } else {
+                                    for (const auto& [other_cid, other] : connections_) {
+                                        if (other_cid != cid && other.events_fired &&
+                                            other.state == ConnState::ACTIVE) {
+                                            should_delay = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+
                             if (!conn.game_activated) {
                                 LOG_INFO(Lib_Net,
                                          "KernelP2P: echo bilateral confirmed for conn_id={} "
                                          "npid='{}' -- DEFERRED (game not activated yet, "
                                          "will fire on ActivatePeer)",
                                          cid, conn.npid);
+                            } else if (should_delay) {
+                                conn.data_phase_active = true;
+                                conn.data_phase_start = now_tp;
+                                LOG_INFO(Lib_Net,
+                                         "KernelP2P: echo bilateral confirmed for conn_id={} "
+                                         "npid='{}' after {} probes/{} responses -- "
+                                         "entering DATA exchange phase ({}ms, my_member={})",
+                                         cid, conn.npid, conn.echo_probes_sent,
+                                         conn.echo_responses_received,
+                                         DATA_EXCHANGE_DURATION.count(), my_member_id_);
                             } else {
-                            conn.events_fired = true;
-                            conn.mutual_fired = true;
-                            conn.last_event_time = now_tp;
-                            to_fire.push_back({conn.ctx_id, cid});
+                                conn.events_fired = true;
+                                conn.mutual_fired = true;
+                                conn.last_event_time = now_tp;
+                                to_fire.push_back({conn.ctx_id, cid});
+                                LOG_INFO(Lib_Net,
+                                         "KernelP2P: echo bilateral confirmed for conn_id={} "
+                                         "npid='{}' after {} probes/{} responses rtt={}us "
+                                         "bw={}B/s -- ESTABLISHED immediate (my_member={}, "
+                                         "stun={})",
+                                         cid, conn.npid, conn.echo_probes_sent,
+                                         conn.echo_responses_received, rtt_us, conn.bandwidth_bps,
+                                         my_member_id_, static_cast<int>(conn.stun_state));
                             }
-                            LOG_INFO(Lib_Net,
-                                     "KernelP2P: echo bilateral confirmed for conn_id={} "
-                                     "npid='{}' after {} probes/{} responses rtt={}us "
-                                     "bw={}B/s -- ESTABLISHED immediate (my_member={}, "
-                                     "stun={})",
-                                     cid, conn.npid, conn.echo_probes_sent,
-                                     conn.echo_responses_received, rtt_us, conn.bandwidth_bps,
-                                     my_member_id_, static_cast<int>(conn.stun_state));
+                        } else if (conn.data_phase_active) {
+                            // During DATA exchange phase -- check completion timer
+                            auto elapsed = now_tp - conn.data_phase_start;
+                            if (elapsed >= DATA_EXCHANGE_DURATION) {
+                                conn.data_phase_active = false;
+                                conn.events_fired = true;
+                                conn.mutual_fired = true;
+                                conn.last_event_time = now_tp;
+                                to_fire.push_back({conn.ctx_id, cid});
+                                LOG_INFO(Lib_Net,
+                                         "KernelP2P: DATA exchange complete for conn_id={} "
+                                         "npid='{}' ({}ms elapsed) -- firing ESTABLISHED",
+                                         cid, conn.npid,
+                                         std::chrono::duration_cast<std::chrono::milliseconds>(
+                                             elapsed).count());
+                            }
                         }
                     }
                 }
