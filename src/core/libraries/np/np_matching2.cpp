@@ -2299,20 +2299,20 @@ static bool HandleHostPeerLeftEvent(u16 departed_member_id, const std::string& o
         g_state.known_member_count = static_cast<int>(g_state.peers.size());
     }
 
-    // Mark the departed peer's connections as inactive but do not remove them.
-    // P2P transport persists across room leave/rejoin.
+    // Mark the departed peer's NpSignaling connection as inactive.
     NpSignaling::SetConnectionInactive(online_id);
 
+    // Remove the peer from KernelP2P entirely (connection + peers_ entry).
+    // This prevents stale NAT addresses from being reused if the same peer
+    // reconnects later with a different NAT mapping. Without this, ActivatePeer
+    // finds the old peers_ entry and sends echo probes to the wrong address.
     auto& kernel = Libraries::Net::KernelP2PSubsystem::Instance();
-    s32 conn_id = kernel.GetConnIdByNpid(online_id);
-    if (conn_id > 0) {
-        kernel.DeactivatePeer(conn_id);
-        if (peer_addr != 0) {
-            Libraries::Net::P2PFlushPacketsFromPeer(peer_addr, peer_port);
-        }
+    kernel.RemovePeer(departed_member_id);
+    if (peer_addr != 0) {
+        Libraries::Net::P2PFlushPacketsFromPeer(peer_addr, peer_port);
     }
 
-    NP_LOG("HandleHostPeerLeftEvent: deactivated connection for departed "
+    NP_LOG("HandleHostPeerLeftEvent: removed peer for departed "
            "member={} npid='{}'",
            departed_member_id, online_id);
 
@@ -2482,16 +2482,13 @@ static PS4_SYSV_ABI void* GuestPollThreadFunc(void* /*arg*/) {
             LOG_WARNING(Lib_NpMatching2, "guest member poll: member {} ({}) departed", dep_mid,
                         dep.online_id);
 
-            // Set NpSignaling INACTIVE + deactivate kernel + flush BEFORE 0x1102
+            // Set NpSignaling INACTIVE + remove kernel peer + flush BEFORE 0x1102
             NpSignaling::SetConnectionInactive(dep.online_id);
             {
                 auto& kernel = Libraries::Net::KernelP2PSubsystem::Instance();
-                s32 conn_id = kernel.GetConnIdByNpid(dep.online_id);
-                if (conn_id > 0) {
-                    kernel.DeactivatePeer(conn_id);
-                    if (dep_addr != 0) {
-                        Libraries::Net::P2PFlushPacketsFromPeer(dep_addr, dep_port);
-                    }
+                kernel.RemovePeer(dep_mid);
+                if (dep_addr != 0) {
+                    Libraries::Net::P2PFlushPacketsFromPeer(dep_addr, dep_port);
                 }
             }
 

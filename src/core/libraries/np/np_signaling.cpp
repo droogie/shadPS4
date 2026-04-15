@@ -512,7 +512,14 @@ static void KernelEventBridge(s32 ctx_id, s32 conn_id, s32 event, u32 delay_ms) 
     // Drive the connection state machine.
     // ESTABLISHED/MUTUAL_ACTIVATED advance toward 0xa; DEAD delivered directly.
     if (event == 0) {
-        // DEAD: deliver directly -- needed for error handling
+        // DEAD: deliver to game + reset NpSignaling state.
+        // Without the reset, the sig connection stays stuck at an intermediate
+        // state (e.g., ECHO_PROBE) after KernelP2P's 30s timeout fires DEAD.
+        std::string dead_npid =
+            Libraries::Net::KernelP2PSubsystem::Instance().GetNpidForConn(conn_id);
+        if (!dead_npid.empty()) {
+            SetConnectionInactive(dead_npid);
+        }
         DeliverSignalingEventForCtx(ctx_id, conn_id, static_cast<u32>(event), delay_ms);
         return;
     }
@@ -541,13 +548,22 @@ static void KernelEventBridge(s32 ctx_id, s32 conn_id, s32 event, u32 delay_ms) 
                 for (auto& [cid, conn] : s_sig_connections) {
                     if (conn.npid == event_npid) {
                         sig_conn_id = cid;
-                        // The kernel conn_id doesn't match the sig conn_id —
-                        // this is a NEW connection for the same npid (peer
-                        // re-joined a room). Reset the state machine so
-                        // ESTABLISHED can be re-processed and callbacks re-fire.
-                        // Without this, a stale ACTIVE state from a previous
-                        // session blocks OnPeerEstablished, preventing the HOST
-                        // from sending TYPE=1 to the GUEST.
+                        if (conn.state == SIG_STATE_ACTIVE ||
+                            conn.state == SIG_STATE_IDLE) {
+                            // ACTIVE: duplicate event (e.g., MUTUAL_ACTIVATED after
+                            // ESTABLISHED already drove to ACTIVE). Resetting would
+                            // cause cascading duplicate callbacks.
+                            // IDLE: peer already departed (SetConnectionInactive ran).
+                            // A late ESTABLISHED from in-flight echo probes must not
+                            // resurrect a departed peer's connection.
+                            LOG_INFO(Lib_NpSignaling,
+                                     "KernelEventBridge: sig conn={} npid='{}' in "
+                                     "state={}, skipping re-fire for kernel conn={}",
+                                     cid, event_npid, conn.state, conn_id);
+                            return;
+                        }
+                        // Not yet ACTIVE -- reset state machine so ESTABLISHED
+                        // can be processed and callbacks fire.
                         conn.state = SIG_STATE_PENDING;
                         conn.state_start = std::chrono::steady_clock::now();
                         conn.has_peer_info = true;

@@ -138,7 +138,7 @@ s32 KernelP2PSubsystem::ActivatePeer(s32 ctx_id, const std::string& npid) {
         s32 ctx_id;
         s32 conn_id;
         bool needs_stun;
-        bool is_host_peer; // HOST<->GUEST (true) or mesh (false)
+        bool i_send_offer; // true = we send STUN OFFER, false = we wait for OFFER
         u32 peer_addr;
         u16 peer_port;
         std::string peer_npid;
@@ -312,8 +312,10 @@ s32 KernelP2PSubsystem::ActivatePeer(s32 ctx_id, const std::string& npid) {
                 }
                 if (needs_stun_ap) {
                     conn.stun_state = StunState::PENDING;
-                    stun_deferred.push_back({ctx_id, cid, true,
-                                             (my_member_id_ == 1 || matched->member_id == 1),
+                    bool host_peer = (my_member_id_ == 1 || matched->member_id == 1);
+                    bool send_offer = host_peer ? (my_member_id_ == 1)
+                                                : (my_member_id_ > matched->member_id);
+                    stun_deferred.push_back({ctx_id, cid, true, send_offer,
                                              matched->addr, matched->port, npid});
                     LOG_INFO(Lib_Net,
                              "KernelP2P: ActivatePeer NEW npid='{}' conn_id={} "
@@ -366,8 +368,9 @@ fire_deferred:
         }
     }
     // Queue STUN OFFERs for reconnecting peers (SetPeerInfo skipped INACTIVE conns).
+    // Both HOST<->GUEST and mesh peer reconnections need STUN when applicable.
     for (const auto& st : stun_deferred) {
-        if (st.needs_stun && st.is_host_peer) {
+        if (st.needs_stun && st.i_send_offer) {
             QueueStunOffer(st.ctx_id, st.conn_id, st.peer_addr, st.peer_port, st.peer_npid);
         }
     }
@@ -1497,21 +1500,16 @@ void KernelP2PSubsystem::SignalingThreadFunc() {
                              matched_conn->conn_id);
                 }
 
-                // Event firing is handled by the ACCEPT handler below
-                // (checks game_activated + echo_bilateral + !events_fired).
-                // Just queue the ACCEPT here.
-                to_accept.push_back({matched_conn->ctx_id, matched_conn->conn_id,
-                                     relay.mapped_addr, relay.mapped_port});
-
                 LOG_INFO(Lib_Net,
                          "KernelP2P: STUN relay resolved conn_id={} npid='{}' -> "
                          "STUN COMPLETE mapped={}:{} game_activated={}",
                          matched_conn->conn_id, matched_conn->npid, mapped_buf,
                          ntohs(relay.mapped_port), matched_conn->game_activated ? "yes" : "no");
 
-                // Always send ACCEPT (NAT punch), but only fire events if game is ready
-                to_accept.push_back({matched_conn->ctx_id, matched_conn->conn_id, relay.mapped_addr,
-                                     relay.mapped_port});
+                // Queue ACCEPT (NAT punch). Event firing is handled by the
+                // ACCEPT handler below (checks game_activated + echo_bilateral).
+                to_accept.push_back({matched_conn->ctx_id, matched_conn->conn_id,
+                                     relay.mapped_addr, relay.mapped_port});
             } else {
                 // No matching PENDING connection. This peer's STUN is already
                 // COMPLETE or no connection exists. Don't send speculative ACCEPTs
