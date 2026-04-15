@@ -364,7 +364,7 @@ fire_deferred:
     for (const auto& ev : deferred) {
         FireEstablished(ev.ctx_id, ev.conn_id, 200);
         if (ev.fire_mutual) {
-            FireMutualActivated(ev.ctx_id, ev.conn_id, 250);
+            FireMutualActivated(ev.ctx_id, ev.conn_id, 3000);
         }
     }
     // Queue STUN OFFERs for reconnecting peers (SetPeerInfo skipped INACTIVE conns).
@@ -557,15 +557,16 @@ int KernelP2PSubsystem::GetConnectionStatus(s32 conn_id, s32* status_out, u32* a
     if (it != connections_.end()) {
         const auto& conn = it->second;
 
-        // Firmware behavior (sub_404640): immediate state read, no gates.
-        //   state == INACTIVE  -> return 0 (INACTIVE)
-        //   state == ACTIVE    -> return 2 (ACTIVE) + fill addr/port
-        //   all others         -> return 1 (PENDING)
+        // State read with GCS gate: ACTIVE connections report PENDING until
+        // ESTABLISHED has been fired (events_fired=true). This prevents the
+        // game's SocketState pipeline from reading ACTIVE before the signaling
+        // pipeline has populated SigDataManager. Without this gate, the
+        // pipeline takes a wrong branch and skips ConnObj setup.
         s32 status;
         if (conn.state == ConnState::INACTIVE) {
             status = CONN_STATUS_INACTIVE;
         } else if (conn.state == ConnState::ACTIVE) {
-            status = CONN_STATUS_ACTIVE;
+            status = conn.events_fired ? CONN_STATUS_ACTIVE : CONN_STATUS_PENDING;
         } else {
             status = CONN_STATUS_PENDING;
         }
@@ -1584,7 +1585,7 @@ void KernelP2PSubsystem::SignalingThreadFunc() {
             }
             if (should_fire) {
                 FireEstablished(ev.ctx_id, ev.conn_id, 200);
-                FireMutualActivated(ev.ctx_id, ev.conn_id, 250);
+                FireMutualActivated(ev.ctx_id, ev.conn_id, 3000);
             } else {
                 LOG_INFO(Lib_Net,
                          "KernelP2P: STUN ACCEPT sent for conn_id={} -- not all conditions met "
@@ -1616,8 +1617,10 @@ static constexpr u8 ECHO_TYPE_RESPONSE = 0x07;
 //   STUN connections skip Phase 2.
 // Firmware timing: 200ms main callout tick (sceNpCalloutStartOnCtx 0x30d40 us).
 static constexpr auto ECHO_PROBE_INTERVAL = std::chrono::milliseconds(200);
-// Firmware timing: 60-second keepalive after ESTABLISHED (0x3938700 us).
-static constexpr auto ECHO_KEEPALIVE_INTERVAL = std::chrono::seconds(60);
+// 10-second keepalive after ESTABLISHED. More aggressive than firmware (60s)
+// but needed for WAN: consumer NATs often have 30-40s UDP idle timeouts,
+// and a 60s gap causes the NAT mapping to expire silently.
+static constexpr auto ECHO_KEEPALIVE_INTERVAL = std::chrono::seconds(10);
 static constexpr int ECHO_PROBES_FOR_ESTABLISHED = 3;
 
 // DATA exchange phase duration (GUEST/INVADER LAN only, late-joiners).
@@ -1800,7 +1803,7 @@ void KernelP2PSubsystem::SendEchoProbes() {
     // Fire deferred echo completion events outside lock (before probes).
     for (const auto& ev : echo_fire_deferred) {
         FireEstablished(ev.ctx_id, ev.conn_id, 0);
-        FireMutualActivated(ev.ctx_id, ev.conn_id, 50);
+        FireMutualActivated(ev.ctx_id, ev.conn_id, 3000);
     }
 
     // Fire DEAD for unreachable peers so the game can move on.
@@ -2027,7 +2030,9 @@ void KernelP2PSubsystem::ProcessEchoProbe(u32 from_addr, u16 from_port, const u8
 
         for (const auto& ev : to_fire) {
             FireEstablished(ev.ctx_id, ev.conn_id, 0);
-            FireMutualActivated(ev.ctx_id, ev.conn_id, 50);
+            // Delay MUTUAL by 3s so SocketState state 9 has time to send
+            // handshake type 2 before the event advances the state machine.
+            FireMutualActivated(ev.ctx_id, ev.conn_id, 3000);
         }
     }
 }
@@ -2235,13 +2240,13 @@ void KernelP2PSubsystem::OnPeerPacketReceived(u32 peer_addr) {
     }
 
     for (const auto& ev : to_fire) {
-        // Firmware fires MUTUAL_ACTIVATED immediately after ESTABLISHED.
-        // No artificial delay.
+        // Delay MUTUAL by 3s so SocketState state 9 blocks long enough
+        // for ConnObj's slow path to read SigDataManager data.
         LOG_INFO(Lib_Net,
                  "KernelP2P: OnPeerPacketReceived -- bilateral P2P confirmed, "
-                 "firing MUTUAL_ACTIVATED for conn_id={}",
+                 "firing MUTUAL_ACTIVATED for conn_id={} (delay=3000ms)",
                  ev.conn_id);
-        FireMutualActivated(ev.ctx_id, ev.conn_id, 50);
+        FireMutualActivated(ev.ctx_id, ev.conn_id, 3000);
     }
 }
 
