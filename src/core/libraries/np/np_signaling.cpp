@@ -520,7 +520,21 @@ static void KernelEventBridge(s32 ctx_id, s32 conn_id, s32 event, u32 delay_ms) 
         if (!dead_npid.empty()) {
             SetConnectionInactive(dead_npid);
         }
-        DeliverSignalingEventForCtx(ctx_id, conn_id, static_cast<u32>(event), delay_ms);
+        // Translate kernel conn_id → NpSignaling conn_id for the game callback.
+        // Kernel and NpSignaling use independent ID spaces. Passing the raw kernel
+        // conn_id causes the game to deactivate the wrong peer (e.g., ancat's kernel
+        // conn_id=3 maps to Scorched-Knight's sig conn_id=3).
+        s32 sig_cid = conn_id;
+        if (!dead_npid.empty()) {
+            std::lock_guard lock(s_sig_mutex);
+            for (const auto& [cid, conn] : s_sig_connections) {
+                if (conn.npid == dead_npid) {
+                    sig_cid = cid;
+                    break;
+                }
+            }
+        }
+        DeliverSignalingEventForCtx(ctx_id, sig_cid, static_cast<u32>(event), delay_ms);
         return;
     }
 
@@ -548,18 +562,17 @@ static void KernelEventBridge(s32 ctx_id, s32 conn_id, s32 event, u32 delay_ms) 
                 for (auto& [cid, conn] : s_sig_connections) {
                     if (conn.npid == event_npid) {
                         sig_conn_id = cid;
-                        if (conn.state == SIG_STATE_ACTIVE ||
-                            conn.state == SIG_STATE_IDLE) {
-                            // ACTIVE: duplicate event (e.g., MUTUAL_ACTIVATED after
-                            // ESTABLISHED already drove to ACTIVE). Resetting would
-                            // cause cascading duplicate callbacks.
-                            // IDLE: peer already departed (SetConnectionInactive ran).
-                            // A late ESTABLISHED from in-flight echo probes must not
-                            // resurrect a departed peer's connection.
+                        if (conn.state == SIG_STATE_ACTIVE) {
+                            // Already ACTIVE — duplicate event (e.g., MUTUAL_ACTIVATED
+                            // arriving after ESTABLISHED already drove to ACTIVE).
+                            // Resetting would cause cascading duplicate callbacks.
+                            // NOTE: IDLE connections are NOT skipped — they represent
+                            // departed peers who may be re-joining. The ESTABLISHED
+                            // event from a new kernel conn should re-activate them.
                             LOG_INFO(Lib_NpSignaling,
-                                     "KernelEventBridge: sig conn={} npid='{}' in "
-                                     "state={}, skipping re-fire for kernel conn={}",
-                                     cid, event_npid, conn.state, conn_id);
+                                     "KernelEventBridge: sig conn={} npid='{}' already "
+                                     "ACTIVE, skipping re-fire for kernel conn={}",
+                                     cid, event_npid, conn_id);
                             return;
                         }
                         // Not yet ACTIVE -- reset state machine so ESTABLISHED
