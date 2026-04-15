@@ -765,6 +765,17 @@ s32 KernelP2PSubsystem::GetConnIdByNpid(const std::string& npid) const {
     return (it != npid_to_conn_.end()) ? it->second : 0;
 }
 
+bool KernelP2PSubsystem::IsEchoBilateral(const std::string& npid) const {
+    std::lock_guard lock(mutex_);
+    auto it = npid_to_conn_.find(npid);
+    if (it == npid_to_conn_.end())
+        return false;
+    auto conn_it = connections_.find(it->second);
+    if (conn_it == connections_.end())
+        return false;
+    return conn_it->second.echo_bilateral;
+}
+
 std::string KernelP2PSubsystem::GetNpidForConn(s32 conn_id) const {
     std::lock_guard lock(mutex_);
     auto it = connections_.find(conn_id);

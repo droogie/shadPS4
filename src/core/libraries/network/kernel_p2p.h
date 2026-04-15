@@ -138,6 +138,12 @@ public:
     // Used by sceNpMatching2SignalingGetConnectionStatus (pure read).
     s32 GetConnIdByNpid(const std::string& npid) const;
 
+    // Check if echo bilateral confirmation has completed for a peer.
+    // This is the true P2P connectivity indicator -- unlike ConnState::ACTIVE
+    // (which means addr/port known), echo_bilateral means UDP packets have
+    // been exchanged bidirectionally and NAT punch-through succeeded.
+    bool IsEchoBilateral(const std::string& npid) const;
+
     // Get the npid for a kernel conn_id. Returns empty string if not found.
     // Used by KernelEventBridge to map kernel events to NpSignaling connections.
     std::string GetNpidForConn(s32 conn_id) const;

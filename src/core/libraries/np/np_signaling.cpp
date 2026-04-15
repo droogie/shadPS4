@@ -265,7 +265,10 @@ static KernelEchoState QueryKernelEchoState(const std::string& npid) {
     if (kern_cid > 0) {
         s32 kern_status = 0;
         kernel.GetConnectionStatus(kern_cid, &kern_status, &result.addr, &result.port);
-        result.active = (kern_status == 2); // ACTIVE = echo bilateral done
+        // ConnState::ACTIVE means addr/port known (set early in SetPeerInfo).
+        // IsEchoBilateral checks actual UDP echo confirmation -- the true P2P
+        // connectivity indicator needed for NAT punch-through over the internet.
+        result.active = kernel.IsEchoBilateral(npid);
     }
     return result;
 }
