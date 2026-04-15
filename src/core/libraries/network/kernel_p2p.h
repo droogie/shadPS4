@@ -284,6 +284,7 @@ private:
         // Firmware-style timestamps (sub_4089f0 pattern: records time of each state change).
         std::chrono::steady_clock::time_point state_changed_at{}; // when state last changed
         std::chrono::steady_clock::time_point last_event_time{};  // when last event was fired
+        std::chrono::steady_clock::time_point gcs_active_at{};    // GCS reports ACTIVE after this time
 
         // Echo probe state for bilateral connectivity confirmation.
         // Firmware: SceNpMatching2SigEcho thread, 200ms tick (callout 0x30d40 us),

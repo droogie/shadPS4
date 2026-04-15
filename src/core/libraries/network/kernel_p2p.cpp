@@ -209,6 +209,8 @@ s32 KernelP2PSubsystem::ActivatePeer(s32 ctx_id, const std::string& npid) {
                         // Bilateral done -- fire immediately
                         conn.events_fired = true;
                         conn.mutual_fired = true;
+                        conn.gcs_active_at =
+                            std::chrono::steady_clock::now() + std::chrono::milliseconds(150);
                         conn.last_event_time = std::chrono::steady_clock::now();
                         deferred.push_back({ctx_id, cid, true});
                         LOG_INFO(Lib_Net,
@@ -513,6 +515,7 @@ int KernelP2PSubsystem::DeactivatePeer(s32 conn_id) {
             it->second.echo_bilateral = false;
             it->second.data_phase_active = false;
             it->second.game_activated = false;
+            it->second.gcs_active_at = {};
             it->second.echo_probes_sent = 0;
             it->second.echo_responses_received = 0;
             it->second.echo_start_at = {};
@@ -558,12 +561,23 @@ int KernelP2PSubsystem::GetConnectionStatus(s32 conn_id, s32* status_out, u32* a
     if (it != connections_.end()) {
         const auto& conn = it->second;
 
-        // Firmware behavior (sub_404640): immediate state read, no gates.
+        // GCS gate: ACTIVE connections report PENDING until events_fired=true
+        // AND gcs_active_at has passed (150ms after ESTABLISHED). This gives
+        // the game's SocketState pipeline time to create ConnObjs before
+        // seeing ACTIVE. Without this delay, the game processes ConnObjs
+        // before signaling data is populated and tears down the connection.
         s32 status;
         if (conn.state == ConnState::INACTIVE) {
             status = CONN_STATUS_INACTIVE;
         } else if (conn.state == ConnState::ACTIVE) {
-            status = CONN_STATUS_ACTIVE;
+            if (!conn.events_fired) {
+                status = CONN_STATUS_PENDING;
+            } else if (conn.gcs_active_at != std::chrono::steady_clock::time_point{} &&
+                       std::chrono::steady_clock::now() < conn.gcs_active_at) {
+                status = CONN_STATUS_PENDING;
+            } else {
+                status = CONN_STATUS_ACTIVE;
+            }
         } else {
             status = CONN_STATUS_PENDING;
         }
@@ -1582,6 +1596,8 @@ void KernelP2PSubsystem::SignalingThreadFunc() {
                     it->second.events_fired = true;
                     it->second.mutual_fired = true;
                     it->second.echo_bilateral = true; // STUN confirms connectivity
+                    it->second.gcs_active_at =
+                        std::chrono::steady_clock::now() + std::chrono::milliseconds(150);
                     it->second.last_event_time = std::chrono::steady_clock::now();
                     should_fire = true;
                 }
@@ -1727,6 +1743,7 @@ void KernelP2PSubsystem::SendEchoProbes() {
                     conn.data_phase_active = false;
                     conn.events_fired = true;
                     conn.mutual_fired = true;
+                    conn.gcs_active_at = now + std::chrono::milliseconds(150);
                     conn.last_event_time = now;
                     echo_fire_deferred.push_back({conn.ctx_id, cid});
                     LOG_INFO(Lib_Net,
@@ -1747,6 +1764,7 @@ void KernelP2PSubsystem::SendEchoProbes() {
                         // Got some responses -- peer reachable, fire ESTABLISHED
                         conn.events_fired = true;
                         conn.mutual_fired = true;
+                        conn.gcs_active_at = now + std::chrono::milliseconds(150);
                         conn.last_event_time = now;
                         echo_fire_deferred.push_back({conn.ctx_id, cid});
                         LOG_INFO(Lib_Net,
@@ -2042,6 +2060,8 @@ void KernelP2PSubsystem::ProcessEchoProbe(u32 from_addr, u16 from_port, const u8
                             } else {
                                 conn.events_fired = true;
                                 conn.mutual_fired = true;
+                                conn.gcs_active_at = std::chrono::steady_clock::now() +
+                                                     std::chrono::milliseconds(150);
                                 conn.last_event_time = now_tp;
                                 to_fire.push_back({conn.ctx_id, cid});
                                 LOG_INFO(Lib_Net,
@@ -2060,6 +2080,8 @@ void KernelP2PSubsystem::ProcessEchoProbe(u32 from_addr, u16 from_port, const u8
                                 conn.data_phase_active = false;
                                 conn.events_fired = true;
                                 conn.mutual_fired = true;
+                                conn.gcs_active_at = std::chrono::steady_clock::now() +
+                                                     std::chrono::milliseconds(150);
                                 conn.last_event_time = now_tp;
                                 to_fire.push_back({conn.ctx_id, cid});
                                 LOG_INFO(Lib_Net,
