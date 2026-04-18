@@ -619,9 +619,12 @@ StunBindingResult StunClient::ParseResponse(const u8* data, size_t len, const u8
 
     result.success = has_mapped && has_source && has_changed;
 
-    // Return extracted USERNAME to caller via out parameter.
-    // Also store in last_relay_username_ for GetLastRelayUsername() callers.
+    // Return extracted USERNAME via the result struct (per-response) and
+    // also via out parameter. last_relay_username_ is kept for legacy
+    // callers but do NOT rely on it when multiple relay responses may
+    // queue up concurrently — use result.username instead.
     if (!username_str.empty()) {
+        result.username = username_str;
         if (out_username) {
             *out_username = username_str;
         }

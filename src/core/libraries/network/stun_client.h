@@ -64,6 +64,11 @@ struct StunBindingResult {
     u16 source_port{0};
     u32 changed_addr{0}; // server's alternate address
     u16 changed_port{0};
+    std::string username;  // USERNAME attribute extracted from the response.
+                           // Required because multiple relay responses can
+                           // queue up in rapid succession (4+ peer sessions);
+                           // a shared last_relay_username_ global loses the
+                           // per-packet association and misroutes the relay.
 };
 
 // Result of NAT probing

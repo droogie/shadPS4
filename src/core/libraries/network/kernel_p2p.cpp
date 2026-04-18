@@ -1204,7 +1204,13 @@ void KernelP2PSubsystem::SignalingThreadFunc() {
 
         char mapped_buf[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, &relay.mapped_addr, mapped_buf, sizeof(mapped_buf));
-        std::string relay_username = sc->GetLastRelayUsername();
+        // Use the username carried in THIS relay's result — NOT
+        // GetLastRelayUsername(), which returns a shared global that gets
+        // overwritten when multiple relays parse concurrently. In 4+ peer
+        // sessions, several STUN relay responses can queue up in quick
+        // succession; the global reflects only the last one parsed, so all
+        // earlier queued relays would be misrouted to the wrong conn.
+        std::string relay_username = relay.username;
 
         LOG_INFO(Lib_Net, "KernelP2P: STUN relay received -- peer mapped={}:{} username='{}'",
                  mapped_buf, ntohs(relay.mapped_port), relay_username);
