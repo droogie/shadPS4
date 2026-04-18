@@ -2109,6 +2109,13 @@ static bool HandleHostPeerJoinedEvent(const MemberInfo& member, const char* sour
                g_state.ctx.my_member_id);
     }
 
+    // Pre-create the signaling connection for this peer so KernelEventBridge can
+    // route MUTUAL_ACTIVATED / ESTABLISHED kernel events to an NpSignaling conn.
+    // Needed for EVERY peer (initial + subsequent) — without it the game's ConnObj
+    // slow path never gets the Dead→signalingPoll→completionHandler→NxrvEvent 0x0e
+    // chain for the missing peer, and the SosSignEntry stays stuck at state=0.
+    NpSignaling::EnsureSigConnection(g_state.ctx.ctx_id, member.online_id);
+
     // For subsequent peers (session already established), fire 0x5102 immediately.
     // For the initial peer join, defer until signaling is confirmed by the server.
     if (session_established) {
@@ -2125,9 +2132,6 @@ static bool HandleHostPeerJoinedEvent(const MemberInfo& member, const char* sour
                "(session_established, immediate)",
                peer_mid);
     } else {
-        // Initial join: defer 0x5102 until signaling is confirmed active.
-        // Pre-create the signaling connection so events can be delivered.
-        NpSignaling::EnsureSigConnection(g_state.ctx.ctx_id, member.online_id);
         NP_LOG("HandleHostPeerJoinedEvent: peer 0x5102 for member={} DEFERRED "
                "to OnPeerEstablished (initial join)",
                peer_mid);
