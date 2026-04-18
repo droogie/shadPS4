@@ -1280,20 +1280,25 @@ static void HandlePollEvent(const std::string& resp) {
             }
             handled_lifecycle_event = true;
         } else if (event_name == "peer_deactivated") {
-            // Server pushes peer_deactivated on member departure. Fully erase
-            // the peer's HLE state (sig conn + kernel P2P conn) so a rejoin
-            // gets a fresh PENDING entry and the game's native ConnObj does
-            // not short-circuit ActivateConnection. We still do NOT fire
-            // PEER_DEACTIVATED (0xb) through the NpSignaling callback — past
-            // tests showed that could trigger full session teardown; the
-            // MemberLeft room event (0x1102) is sufficient for graceful
-            // departure handling on the game side.
+            // Server pushes peer_deactivated on member departure. Fire DEAD
+            // (0x0) for the departing peer's specific sig conn_id to drive
+            // the game's native per-conn ConnObj teardown (real library
+            // behavior). PEER_DEACTIVATED(0xb) is NOT fired — that's the
+            // event that previously cascaded into full session teardown.
+            // DEAD(0x0) scoped to one matched conn_id is safe and clean.
+            // Then erase HLE state so a rejoin gets fresh entries.
             auto dep_oid = JsonGetString(resp, "OnlineId");
             auto dep_mid = static_cast<u16>(JsonGetInt(resp, "MemberId"));
             LOG_WARNING(Lib_NpMatching2,
                         "invite poll: peer_deactivated member={} online_id='{}' "
-                        "(erasing HLE state, no callback fired)",
+                        "(firing DEAD + erasing HLE state)",
                         dep_mid, dep_oid);
+            s32 sig_conn_id = NpSignaling::GetSignalingConnId(dep_oid);
+            if (sig_conn_id > 0) {
+                NpSignaling::DeliverSignalingEvent(g_state.ctx.ctx_id, sig_conn_id,
+                                                   NpSignaling::ORBIS_NP_SIGNALING_EVENT_DEAD,
+                                                   50);
+            }
             NpSignaling::RemoveConnection(dep_oid);
             auto& kernel = Libraries::Net::KernelP2PSubsystem::Instance();
             kernel.RemoveConnectionByNpid(dep_oid);
@@ -2178,6 +2183,30 @@ static bool HandleHostPeerLeftEvent(u16 departed_member_id, const std::string& o
         peer_port = it->second.port;
         g_state.peers.erase(it);
         g_state.known_member_count = static_cast<int>(g_state.peers.size());
+    }
+
+    // Fire DEAD(0x0) signaling event for this peer's specific sig conn_id
+    // BEFORE erasing HLE state, so KernelEventBridge delivers the event to
+    // the game's callback. DEAD drives the native SocketState case 0 path
+    // which cascades through ConnObj teardown and resets +0x64, so that
+    // when the peer rejoins, completionHandler will re-run cleanly and
+    // fireCompletionNxrvEvent will re-fire NxrvEvent 0x0e, letting the new
+    // SosSignEntry transition 0→1. Without this, the ConnObj sits at +0x64=2
+    // from the previous session and short-circuits the completion chain on
+    // reconnect, leaving the new SosSignEntry stuck at state=0.
+    //
+    // This matches real libSceNpSignaling behavior: DEAD is a PER-CONN event,
+    // scoped to exactly this peer's sig_conn_id. Earlier experiments that
+    // cascaded full-session teardown were firing 0x5101 (Connected) or
+    // PEER_DEACTIVATED(0xb), or firing with an unmatched/invalid conn_id;
+    // DEAD(0x0) with a matched sig_conn_id is the clean per-peer teardown.
+    s32 sig_conn_id = NpSignaling::GetSignalingConnId(online_id);
+    if (sig_conn_id > 0) {
+        NP_LOG("HandleHostPeerLeftEvent: firing DEAD for sig conn_id={} "
+               "npid='{}' to drive native ConnObj teardown",
+               sig_conn_id, online_id);
+        NpSignaling::DeliverSignalingEvent(g_state.ctx.ctx_id, sig_conn_id,
+                                           NpSignaling::ORBIS_NP_SIGNALING_EVENT_DEAD, 50);
     }
 
     // Fully erase all HLE state for the departed peer (sig conn + kernel P2P
