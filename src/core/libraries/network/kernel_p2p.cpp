@@ -342,6 +342,7 @@ int KernelP2PSubsystem::DeactivatePeer(s32 conn_id) {
             it->second.game_activated = false;
             it->second.echo_probes_sent = 0;
             it->second.echo_responses_received = 0;
+            it->second.outstanding_seqs.clear();
             it->second.echo_start_at = {};
             it->second.last_echo_sent = {};
             it->second.last_event_time = {};
@@ -1673,13 +1674,26 @@ void KernelP2PSubsystem::SendEchoProbes() {
                  "KernelP2P: echo probe SENT {} bytes to {:#x}:{} fd={} conn_id={} (result={})",
                  sizeof(pkt), ntohl(t.addr), ntohs(t.port), fd, t.conn_id, sent);
 
-        // Update state
+        // Update state — record seq in the per-conn outstanding-seq map so
+        // ProcessEchoProbe can gate bilateral counting on matched responses.
+        // Also prune entries older than SEQ_TRACK_TTL (keeps the map bounded).
         {
             std::lock_guard lock(mutex_);
             auto it = connections_.find(t.conn_id);
             if (it != connections_.end()) {
-                it->second.last_echo_sent = std::chrono::steady_clock::now();
+                auto now_tp = std::chrono::steady_clock::now();
+                it->second.last_echo_sent = now_tp;
                 it->second.echo_probes_sent++;
+                it->second.outstanding_seqs[seq] = now_tp;
+                constexpr auto SEQ_TRACK_TTL = std::chrono::seconds(30);
+                for (auto sit = it->second.outstanding_seqs.begin();
+                     sit != it->second.outstanding_seqs.end();) {
+                    if (now_tp - sit->second > SEQ_TRACK_TTL) {
+                        sit = it->second.outstanding_seqs.erase(sit);
+                    } else {
+                        ++sit;
+                    }
+                }
             }
         }
     }
@@ -1747,16 +1761,16 @@ void KernelP2PSubsystem::ProcessEchoProbe(u32 from_addr, u16 from_port, u8 vport
     LOG_INFO(Lib_Net, "KernelP2P: ProcessEchoProbe CALLED type={} from={:#x}:{} len={}", type,
              from_addr, ntohs(from_port), len);
 
-    // Both PROBE (type=6) and RESPONSE (type=7) count as bilateral evidence.
-    // Receiving a probe FROM the peer proves they can reach us AND we can reach them
-    // (since they got our address somehow). With symmetric NAT, the peer's public IP
-    // may differ from what we registered, so match by NpId from the payload.
+    // Bilateral counting is GATED on matched RESPONSES. Peer-originated PROBEs
+    // (type=6) previously incremented the counter too, producing bogus 1us /
+    // 535s RTT values (timestamp math against a packet we didn't originate)
+    // and firing ESTABLISHED prematurely — before we'd actually round-tripped
+    // our own probe. We still respond to incoming PROBEs above so the peer's
+    // bilateral can advance; we just don't let theirs advance ours.
     //
-    // VP30 probes (sub_proto=0xFE) are peer-initiated for the peer's own bilateral
-    // check; we respond above but do NOT count them toward VP40 bilateral because we
-    // never initiate VP30 probes ourselves (so the response-to-probe ratio would be
-    // nonsensical, producing bogus rtt/bw and firing ESTABLISHED prematurely).
-    if (!is_vp30 && (type == ECHO_TYPE_PROBE || type == ECHO_TYPE_RESPONSE)) {
+    // VP30 probes (sub_proto=0xFE) are peer-initiated for the peer's own
+    // bilateral check and are never counted (we never initiate on VP30).
+    if (!is_vp30 && type == ECHO_TYPE_RESPONSE) {
         // Compute RTT and check bilateral confirmation.
         // bandwidth = 9,375,000,000 / median_RTT_us (approximated from 94-byte probes).
         struct DeferredFire {
@@ -1765,10 +1779,14 @@ void KernelP2PSubsystem::ProcessEchoProbe(u32 from_addr, u16 from_port, u8 vport
         };
         std::vector<DeferredFire> to_fire;
 
-        // Extract sender's timestamp from the response to compute RTT
+        // Extract our own sent timestamp (peer echoes it back) and seq.
         s64 sent_ts = 0;
+        u32 resp_seq = 0;
         if (len >= 72) {
             std::memcpy(&sent_ts, data + 64, 8);
+        }
+        if (len >= 8) {
+            std::memcpy(&resp_seq, data + 4, 4);
         }
         auto now_tp = std::chrono::steady_clock::now();
         auto now_ts = now_tp.time_since_epoch().count();
@@ -1794,14 +1812,30 @@ void KernelP2PSubsystem::ProcessEchoProbe(u32 from_addr, u16 from_port, u8 vport
                 LOG_INFO(Lib_Net,
                          "KernelP2P: echo match check cid={} conn.addr={:#x} "
                          "conn.port={} from={:#x}:{} echo_started={} "
-                         "match_addr={} match_npid={} probe_npid='{}'",
+                         "match_addr={} match_npid={} probe_npid='{}' seq={}",
                          cid, conn.addr, ntohs(conn.port), from_addr, ntohs(from_port),
-                         conn.echo_started, match_addr, match_npid, probe_npid);
-                if ((match_addr || match_npid) && conn.echo_started) {
-                    conn.echo_responses_received++;
-                    conn.last_echo_recv = now_tp;
+                         conn.echo_started, match_addr, match_npid, probe_npid, resp_seq);
+                if (!((match_addr || match_npid) && conn.echo_started)) {
+                    continue;
+                }
+                // Only count this response if its seq is in our outstanding set
+                // for this conn. Otherwise it's a stale response (prior session),
+                // a response to a different conn, or a forged/replayed packet.
+                auto seq_it = conn.outstanding_seqs.find(resp_seq);
+                if (seq_it == conn.outstanding_seqs.end()) {
+                    LOG_INFO(Lib_Net,
+                             "KernelP2P: echo RESPONSE for conn_id={} npid='{}' seq={} not in "
+                             "outstanding set -- dropping (stale or cross-conn)",
+                             cid, conn.npid, resp_seq);
+                    conn.last_echo_recv = now_tp; // still a liveness signal
+                    continue;
+                }
+                conn.outstanding_seqs.erase(seq_it); // prevent double-count on retransmits
+                conn.echo_responses_received++;
+                conn.last_echo_recv = now_tp;
 
-                    // Update RTT and bandwidth from echo probe timing.
+                // Update RTT and bandwidth from echo probe timing.
+                {
                     conn.rtt_us = rtt_us;
                     if (rtt_us > 0) {
                         conn.bandwidth_bps = static_cast<s32>(

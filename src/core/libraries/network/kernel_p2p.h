@@ -280,6 +280,14 @@ private:
         s32 bandwidth_bps{0}; // computed bandwidth in bytes/sec
         std::chrono::steady_clock::time_point last_echo_recv{};
 
+        // Outstanding outbound probe seqs awaiting a RESPONSE. Keyed by the u32
+        // seq we stamped into payload[4..7]. On a valid response the peer echoes
+        // our seq back; we match against this map to distinguish real RTTs from
+        // peer-originated PROBEs that would otherwise trip the bilateral counter
+        // with bogus 1us / 535s RTT values. Pruned opportunistically on send
+        // (entries older than SEQ_TRACK_TTL are dropped to bound memory).
+        std::map<u32, std::chrono::steady_clock::time_point> outstanding_seqs;
+
         // DATA exchange phase (LAN only).
         // Delays ESTABLISHED after echo bilateral to give the game time to
         // create SocketState entries for 3+ player sessions. Without this,
