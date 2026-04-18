@@ -334,6 +334,14 @@ private:
     std::thread signaling_thread_;
     std::atomic<bool> signaling_shutdown_{false};
 
+    // Reactive STUN re-probe state. Set from SendEchoProbes when any conn
+    // fires peer UNREACHABLE (0 echo responses in 3.5s); consumed by the
+    // signaling loop to kick off an async NatProbe. Throttled 30s minimum.
+    std::atomic<bool> nat_reprobe_pending_{false};
+    std::atomic<bool> nat_reprobe_busy_{false};
+    std::thread nat_reprobe_thread_;
+    std::chrono::steady_clock::time_point last_nat_reprobe_{};
+
     // Signaling thread main function.
     // Phase A: NAT probe (blocking, one-shot)
     // Phase B: processing loop -- dequeue offers, echo probes, keepalive

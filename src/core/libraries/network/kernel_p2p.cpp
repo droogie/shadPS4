@@ -1111,7 +1111,9 @@ void KernelP2PSubsystem::SignalingThreadFunc() {
         sig_loop_tick++;
         auto loop_start = std::chrono::steady_clock::now();
 
-        // Send echo probes for bilateral P2P confirmation.
+        // Send echo probes for bilateral P2P confirmation. If this call fired
+        // "peer UNREACHABLE" for any conn (0 echo responses after 3.5s), it
+        // pulses nat_reprobe_pending_ so we can kick off a STUN re-probe below.
         SendEchoProbes();
 
         // Load stun_client_ once per iteration to avoid TOCTOU races
@@ -1120,6 +1122,44 @@ void KernelP2PSubsystem::SignalingThreadFunc() {
         if (!sc) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
             continue;
+        }
+
+        // Reactive NAT re-probe: triggered when peer UNREACHABLE fires. A
+        // stale WAN mapping (VPN IP rotation, mobile network change) causes
+        // peers to send probes to the wrong address, so 0 responses is a
+        // strong signal our reported address may need refreshing. Async and
+        // throttled — at most one re-probe in flight, min 30s between tries.
+        {
+            constexpr auto NAT_REPROBE_COOLDOWN = std::chrono::seconds(30);
+            auto now_rp = std::chrono::steady_clock::now();
+            if (nat_reprobe_pending_.exchange(false) && nat_probe_done.load() &&
+                !nat_reprobe_busy_.load() &&
+                now_rp - last_nat_reprobe_ >= NAT_REPROBE_COOLDOWN) {
+                last_nat_reprobe_ = now_rp;
+                nat_reprobe_busy_.store(true);
+                if (nat_reprobe_thread_.joinable()) {
+                    nat_reprobe_thread_.join();
+                }
+                nat_reprobe_thread_ = std::thread([this, sc]() {
+                    LOG_INFO(Lib_Net, "KernelP2P: reactive NAT re-probe (triggered by peer "
+                                      "UNREACHABLE) starting");
+                    auto probe = sc->NatProbe();
+                    if (probe.success) {
+                        char buf[INET_ADDRSTRLEN];
+                        inet_ntop(AF_INET, &probe.mapped_addr, buf, sizeof(buf));
+                        LOG_INFO(Lib_Net,
+                                 "KernelP2P: reactive NAT re-probe complete: mapped={}:{} type={}",
+                                 buf, ntohs(probe.mapped_port),
+                                 static_cast<int>(probe.nat_type));
+                        Libraries::Np::NpMatching2::UpdateSignalingAddrFromStun(
+                            std::string(buf), ntohs(probe.mapped_port));
+                    } else {
+                        LOG_WARNING(Lib_Net, "KernelP2P: reactive NAT re-probe failed -- keeping "
+                                             "cached mapping");
+                    }
+                    nat_reprobe_busy_.store(false);
+                });
+            }
         }
 
         // 1. Process pending STUN OFFERs from the queue (synchronous)
@@ -1373,9 +1413,12 @@ void KernelP2PSubsystem::SignalingThreadFunc() {
         }
     }
 
-    // Wait for async NAT probe to finish before exiting
+    // Wait for async NAT probe(s) to finish before exiting
     if (nat_probe_thread.joinable()) {
         nat_probe_thread.join();
+    }
+    if (nat_reprobe_thread_.joinable()) {
+        nat_reprobe_thread_.join();
     }
 
     LOG_INFO(Lib_Net, "KernelP2P: signaling thread exiting");
@@ -1567,6 +1610,14 @@ void KernelP2PSubsystem::SendEchoProbes() {
     // Fire DEAD for unreachable peers so the game can move on.
     for (const auto& ev : unreachable_dead) {
         FireDead(ev.ctx_id, ev.conn_id, 50);
+    }
+
+    // Signal the signaling loop to kick a STUN re-probe. Zero echo responses
+    // in 3.5s often means our WAN mapping is stale (VPN rotated, mobile
+    // handoff, etc.). The loop is throttled so multiple UNREACHABLE events in
+    // quick succession only trigger one probe.
+    if (!unreachable_dead.empty()) {
+        nat_reprobe_pending_.store(true);
     }
 
     // Send probes outside lock
