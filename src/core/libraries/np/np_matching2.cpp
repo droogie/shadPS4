@@ -1168,6 +1168,34 @@ static void HandlePollEvent(const std::string& resp) {
             auto now = std::chrono::steady_clock::now();
             ScheduleRoomEventKickedout(now);
 
+            // Fire DEAD for every peer sig_conn we hold (typically just
+            // HOST). Symmetric with HandleHostPeerLeftEvent: without this
+            // the GUEST's game keeps its ConnObj for HOST believing the
+            // link is still live, and on the next invite (rejoin same
+            // shadPS4 instance) the game won't call ActivateConnection,
+            // so HOST never receives a reciprocal ActivatePacket and
+            // deactivates — leaving the new SosSignEntry stuck at 0.
+            // DEAD(0x0) scoped to each matched sig_conn_id is the
+            // per-conn teardown signal the real library fires.
+            {
+                std::lock_guard<std::mutex> plock(g_state.peers_mutex);
+                for (const auto& [mid, pi] : g_state.peers) {
+                    if (pi.online_id.empty()) {
+                        continue;
+                    }
+                    s32 sig_conn_id = NpSignaling::GetSignalingConnId(pi.online_id);
+                    if (sig_conn_id > 0) {
+                        LOG_WARNING(Lib_NpMatching2,
+                                    "KICKED: firing DEAD for sig conn_id={} npid='{}' "
+                                    "to drive native ConnObj teardown",
+                                    sig_conn_id, pi.online_id);
+                        NpSignaling::DeliverSignalingEvent(
+                            g_state.ctx.ctx_id, sig_conn_id,
+                            NpSignaling::ORBIS_NP_SIGNALING_EVENT_DEAD, 50);
+                    }
+                }
+            }
+
             // Do NOT clear session state here. The game needs room_id and
             // peers intact when processing the 0x1103 event. The game's
             // native LeaveRoom handler does cleanup after processing.
