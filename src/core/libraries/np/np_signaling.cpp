@@ -1222,6 +1222,25 @@ void SetConnectionInactive(const std::string& npid) {
     }
 }
 
+// Fully erase every sig connection for this npid. Use this (rather than
+// SetConnectionInactive) when the peer has genuinely left the session so that
+// a subsequent rejoin gets a fresh PENDING entry via EnsureSigConnection —
+// stale IDLE state was causing the game to skip sceNpSignalingActivateConnection
+// on reconnect because its ConnObj still saw the peer as live.
+void RemoveConnection(const std::string& npid) {
+    std::lock_guard lock(s_sig_mutex);
+    for (auto it = s_sig_connections.begin(); it != s_sig_connections.end();) {
+        if (it->second.npid == npid) {
+            LOG_INFO(Lib_NpSignaling,
+                     "RemoveConnection: npid='{}' conn_id={} state={} -- erasing", npid,
+                     it->first, static_cast<int>(it->second.state));
+            it = s_sig_connections.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
 s32 GetSignalingConnId(const std::string& npid) {
     std::lock_guard lock(s_sig_mutex);
     for (const auto& [cid, conn] : s_sig_connections) {

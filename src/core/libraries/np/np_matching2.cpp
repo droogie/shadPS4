@@ -1280,19 +1280,23 @@ static void HandlePollEvent(const std::string& resp) {
             }
             handled_lifecycle_event = true;
         } else if (event_name == "peer_deactivated") {
-            // Server pushes peer_deactivated on member departure. Set the
-            // NpSignaling connection INACTIVE but do NOT fire PEER_DEACTIVATED
-            // (0xb) through the NpSignaling 5-arg callback. The game's
-            // Do not fire PEER_DEACTIVATED through the NpSignaling callback
-            // as it can trigger full session teardown. The MemberLeft room event
-            // (0x1102) is sufficient for graceful departure handling.
+            // Server pushes peer_deactivated on member departure. Fully erase
+            // the peer's HLE state (sig conn + kernel P2P conn) so a rejoin
+            // gets a fresh PENDING entry and the game's native ConnObj does
+            // not short-circuit ActivateConnection. We still do NOT fire
+            // PEER_DEACTIVATED (0xb) through the NpSignaling callback — past
+            // tests showed that could trigger full session teardown; the
+            // MemberLeft room event (0x1102) is sufficient for graceful
+            // departure handling on the game side.
             auto dep_oid = JsonGetString(resp, "OnlineId");
             auto dep_mid = static_cast<u16>(JsonGetInt(resp, "MemberId"));
             LOG_WARNING(Lib_NpMatching2,
                         "invite poll: peer_deactivated member={} online_id='{}' "
-                        "(NpSignaling set INACTIVE, no callback fired)",
+                        "(erasing HLE state, no callback fired)",
                         dep_mid, dep_oid);
-            NpSignaling::SetConnectionInactive(dep_oid);
+            NpSignaling::RemoveConnection(dep_oid);
+            auto& kernel = Libraries::Net::KernelP2PSubsystem::Instance();
+            kernel.RemoveConnectionByNpid(dep_oid);
             handled_lifecycle_event = true;
         } else {
             LOG_WARNING(Lib_NpMatching2, "invite poll: unknown matching2 event '{}'", event_name);
@@ -2176,9 +2180,13 @@ static bool HandleHostPeerLeftEvent(u16 departed_member_id, const std::string& o
         g_state.known_member_count = static_cast<int>(g_state.peers.size());
     }
 
-    // Mark the departed peer's connections as inactive but do not remove them.
-    // P2P transport persists across room leave/rejoin.
-    NpSignaling::SetConnectionInactive(online_id);
+    // Fully erase all HLE state for the departed peer (sig conn + kernel P2P
+    // conn + pending packets). Keeping stale IDLE entries around caused the
+    // game's native ConnObj to skip sceNpSignalingActivateConnection on the
+    // peer's next rejoin — it saw its own ConnObj as "still live" and would
+    // instead fire DeactivateConnection when our HLE delivered ESTABLISHED
+    // for the new conn_id, leaving SosSignEntry stuck at state=0.
+    NpSignaling::RemoveConnection(online_id);
 
     auto& kernel = Libraries::Net::KernelP2PSubsystem::Instance();
     s32 conn_id = kernel.GetConnIdByNpid(online_id);
@@ -2188,8 +2196,9 @@ static bool HandleHostPeerLeftEvent(u16 departed_member_id, const std::string& o
             Libraries::Net::P2PFlushPacketsFromPeer(peer_addr, peer_port);
         }
     }
+    kernel.RemoveConnectionByNpid(online_id);
 
-    NP_LOG("HandleHostPeerLeftEvent: deactivated connection for departed "
+    NP_LOG("HandleHostPeerLeftEvent: erased HLE state for departed "
            "member={} npid='{}'",
            departed_member_id, online_id);
 
