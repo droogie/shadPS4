@@ -331,15 +331,17 @@ struct SharedTransport {
                 continue;
             }
 
-            // Echo probes: [FF 83 FF FD ...] -- detect by raw bytes before vport parsing.
-            // flags=0x83, followed by FF FD which are the 1-byte src/dst vport values.
+            // Echo probes: [FF 83 FF FD ...] (VP40 / signaling, vport 0xFFFD)
+            //           or [FF 83 FF FE ...] (VP30 / game data, vport 0xFFFE)
+            // flags=0x83, followed by FF FD/FE which are the 1-byte src/dst vport values.
             // The kernel treats these identically to any other vport packet.
-            if (n >= 4 && buf[2] == 0xFF && buf[3] == 0xFD) {
-                // Strip the 4-byte wire header, pass payload to echo handler
-                LOG_INFO(Lib_Net, "P2P Drain: echo probe detected! {} bytes from {:#x}:{}", n,
-                         ntohl(from.sin_addr.s_addr), ntohs(from.sin_port));
+            // VP30 echo is required for peer's FrpgNetConnectStep to populate; without
+            // it the ConnObj pipeline stalls and SosSignEntry stays at state=0.
+            if (n >= 4 && buf[2] == 0xFF && (buf[3] == 0xFD || buf[3] == 0xFE)) {
+                LOG_INFO(Lib_Net, "P2P Drain: echo probe detected (vport=0xFF{:02X})! {} bytes from {:#x}:{}",
+                         buf[3], n, ntohl(from.sin_addr.s_addr), ntohs(from.sin_port));
                 KernelP2PSubsystem::Instance().ProcessEchoProbe(from.sin_addr.s_addr, from.sin_port,
-                                                                &buf[4], n - 4);
+                                                                buf[3], &buf[4], n - 4);
                 continue;
             }
 

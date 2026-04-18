@@ -351,7 +351,10 @@ private:
 
 public:
     // Called from P2P transport Drain() when an echo probe packet arrives.
-    void ProcessEchoProbe(u32 from_addr, u16 from_port, const u8* data, size_t len);
+    // vport_lo is the low byte of the source vport the probe arrived on (0xFD for VP40,
+    // 0xFE for VP30). Responses are sent back with the matching vport so the peer's
+    // per-vport bilateral counter advances.
+    void ProcessEchoProbe(u32 from_addr, u16 from_port, u8 vport_lo, const u8* data, size_t len);
 
 private:
     // Pending OFFER queue -- SetPeerInfo pushes, signaling thread processes.

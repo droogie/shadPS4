@@ -1634,13 +1634,13 @@ void KernelP2PSubsystem::SendEchoProbes() {
     }
 }
 
-void KernelP2PSubsystem::ProcessEchoProbe(u32 from_addr, u16 from_port, const u8* data,
-                                          size_t len) {
+void KernelP2PSubsystem::ProcessEchoProbe(u32 from_addr, u16 from_port, u8 vport_lo,
+                                          const u8* data, size_t len) {
     LOG_INFO(Lib_Net,
-             "KernelP2P: ProcessEchoProbe ENTRY from={:#x}:{} len={} "
+             "KernelP2P: ProcessEchoProbe ENTRY from={:#x}:{} vport=0xFF{:02X} len={} "
              "data[0:4]={:02x}{:02x}{:02x}{:02x}",
-             ntohl(from_addr), ntohs(from_port), len, len > 0 ? data[0] : 0, len > 1 ? data[1] : 0,
-             len > 2 ? data[2] : 0, len > 3 ? data[3] : 0);
+             ntohl(from_addr), ntohs(from_port), vport_lo, len, len > 0 ? data[0] : 0,
+             len > 1 ? data[1] : 0, len > 2 ? data[2] : 0, len > 3 ? data[3] : 0);
 
     if (len < ECHO_PROBE_SIZE) {
         LOG_WARNING(Lib_Net, "KernelP2P: ProcessEchoProbe -- len {} < ECHO_PROBE_SIZE {}, dropping",
@@ -1648,25 +1648,31 @@ void KernelP2PSubsystem::ProcessEchoProbe(u32 from_addr, u16 from_port, const u8
         return;
     }
 
-    // Check sub-protocol ID
-    if (data[0] != 0xFF || data[1] != 0xFD) {
+    // Check sub-protocol ID: 0xFF 0xFD (VP40 signaling) or 0xFF 0xFE (VP30 game data).
+    // The payload's sub-protocol byte should mirror the src vport low byte.
+    if (data[0] != 0xFF || (data[1] != 0xFD && data[1] != 0xFE)) {
         LOG_WARNING(Lib_Net,
                     "KernelP2P: ProcessEchoProbe -- bad sub-protocol {:02x}{:02x}, dropping",
                     data[0], data[1]);
         return;
     }
 
+    const u8 sub_proto = data[1]; // 0xFD=VP40, 0xFE=VP30
+    const bool is_vp30 = (sub_proto == 0xFE);
+
     u8 type = data[2];
     auto* sc_ep = stun_client_.load();
     int fd = sc_ep ? sc_ep->GetSocketFd() : -1;
 
     if (type == ECHO_TYPE_PROBE && fd >= 0) {
-        // Received probe request -> send response
+        // Received probe request -> send response on the SAME vport the probe arrived on.
+        // VP30 peers verify bilateral against VP30 echo responses only -- replying on
+        // VP40 would never satisfy their VP30 step chain.
         u8 resp[4 + ECHO_PROBE_SIZE] = {};
         resp[0] = 0xFF;
         resp[1] = 0x83;
         resp[2] = 0xFF;
-        resp[3] = 0xFD;
+        resp[3] = vport_lo; // mirror peer's src vport (0xFD or 0xFE)
 
         u8* payload = resp + 4;
         std::memcpy(payload, data, ECHO_PROBE_SIZE);
@@ -1694,7 +1700,12 @@ void KernelP2PSubsystem::ProcessEchoProbe(u32 from_addr, u16 from_port, const u8
     // Receiving a probe FROM the peer proves they can reach us AND we can reach them
     // (since they got our address somehow). With symmetric NAT, the peer's public IP
     // may differ from what we registered, so match by NpId from the payload.
-    if (type == ECHO_TYPE_PROBE || type == ECHO_TYPE_RESPONSE) {
+    //
+    // VP30 probes (sub_proto=0xFE) are peer-initiated for the peer's own bilateral
+    // check; we respond above but do NOT count them toward VP40 bilateral because we
+    // never initiate VP30 probes ourselves (so the response-to-probe ratio would be
+    // nonsensical, producing bogus rtt/bw and firing ESTABLISHED prematurely).
+    if (!is_vp30 && (type == ECHO_TYPE_PROBE || type == ECHO_TYPE_RESPONSE)) {
         // Compute RTT and check bilateral confirmation.
         // bandwidth = 9,375,000,000 / median_RTT_us (approximated from 94-byte probes).
         struct DeferredFire {
