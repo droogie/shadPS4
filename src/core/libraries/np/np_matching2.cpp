@@ -1168,15 +1168,16 @@ static void HandlePollEvent(const std::string& resp) {
             auto now = std::chrono::steady_clock::now();
             ScheduleRoomEventKickedout(now);
 
-            // Fire DEAD for every peer sig_conn we hold (typically just
-            // HOST). Symmetric with HandleHostPeerLeftEvent: without this
-            // the GUEST's game keeps its ConnObj for HOST believing the
-            // link is still live, and on the next invite (rejoin same
-            // shadPS4 instance) the game won't call ActivateConnection,
-            // so HOST never receives a reciprocal ActivatePacket and
-            // deactivates — leaving the new SosSignEntry stuck at 0.
-            // DEAD(0x0) scoped to each matched sig_conn_id is the
-            // per-conn teardown signal the real library fires.
+            // Fire per-conn teardown events for every known peer (typically
+            // just HOST from GUEST's view). Two independent callback layers
+            // (see HandleHostPeerLeftEvent comment for full rationale):
+            //   NpSignaling DEAD(0x0) — per-conn native ConnObj teardown
+            //   Matching2 SIGNALING_EVENT_DEAD (0x5101) — reaches game's
+            //       SignalingEvent_dispatch 0x5101 branch → setDoneFlag →
+            //       ~10s StepNode → NxrvEvent 0x0f → native cleanup.
+            // Symmetric with HandleHostPeerLeftEvent. Without this the
+            // GUEST's game keeps its ConnObj for HOST alive; on rejoin
+            // (same shadPS4 instance) the game won't call ActivateConnection.
             {
                 std::lock_guard<std::mutex> plock(g_state.peers_mutex);
                 for (const auto& [mid, pi] : g_state.peers) {
@@ -1186,13 +1187,21 @@ static void HandlePollEvent(const std::string& resp) {
                     s32 sig_conn_id = NpSignaling::GetSignalingConnId(pi.online_id);
                     if (sig_conn_id > 0) {
                         LOG_WARNING(Lib_NpMatching2,
-                                    "KICKED: firing DEAD for sig conn_id={} npid='{}' "
-                                    "to drive native ConnObj teardown",
+                                    "KICKED: firing NpSignaling DEAD for sig conn_id={} "
+                                    "npid='{}' to drive native ConnObj teardown",
                                     sig_conn_id, pi.online_id);
                         NpSignaling::DeliverSignalingEvent(
                             g_state.ctx.ctx_id, sig_conn_id,
                             NpSignaling::ORBIS_NP_SIGNALING_EVENT_DEAD, 50);
                     }
+                    PendingEvent sig_ev{};
+                    sig_ev.type = PendingEvent::SIGNALING_CB;
+                    sig_ev.fire_at = now + std::chrono::milliseconds(50);
+                    sig_ev.room_id = g_state.ctx.room_id;
+                    sig_ev.member_id = mid;
+                    sig_ev.sig_event = ORBIS_NP_MATCHING2_SIGNALING_EVENT_DEAD;
+                    sig_ev.conn_id = static_cast<u32>(mid);
+                    ScheduleEvent(std::move(sig_ev));
                 }
             }
 
@@ -1217,7 +1226,10 @@ static void HandlePollEvent(const std::string& resp) {
                 // Fire RoomDestroyed (0x1104) so the game exits cleanly.
                 ScheduleRoomEventRoomDestroyed(now);
 
-                // Fire Dead (0x5101) for all peers.
+                // Fire Matching2 SIGNALING_EVENT_DEAD (0x5101) for all peers.
+                // Reaches mcp_SignalingEvent_dispatch's 0x5101 branch which sets
+                // conn->+0xD8=2 and calls setDoneFlag → schedules the ~10s
+                // post-connected StepNode → NxrvEvent 0x0f → native cleanup.
                 {
                     std::lock_guard<std::mutex> plock(g_state.peers_mutex);
                     for (const auto& [mid, pi] : g_state.peers) {
@@ -1308,13 +1320,16 @@ static void HandlePollEvent(const std::string& resp) {
             }
             handled_lifecycle_event = true;
         } else if (event_name == "peer_deactivated") {
-            // Server pushes peer_deactivated on member departure. Fire DEAD
-            // (0x0) for the departing peer's specific sig conn_id to drive
-            // the game's native per-conn ConnObj teardown (real library
-            // behavior). PEER_DEACTIVATED(0xb) is NOT fired — that's the
-            // event that previously cascaded into full session teardown.
-            // DEAD(0x0) scoped to one matched conn_id is safe and clean.
-            // Then erase HLE state so a rejoin gets fresh entries.
+            // Server pushes peer_deactivated on member departure. Fire the
+            // per-conn teardown events the real library fires, then erase
+            // HLE state. Two independent callback layers (see
+            // HandleHostPeerLeftEvent comment for full rationale):
+            //   NpSignaling DEAD(0x0) — drives native ConnObj +0x64 reset
+            //   Matching2 SIGNALING_EVENT_DEAD (0x5101) — reaches the game's
+            //       SignalingEvent_dispatch 0x5101 branch → setDoneFlag →
+            //       ~10s StepNode → NxrvEvent 0x0f → native cleanup.
+            // PEER_DEACTIVATED(0xb) is NOT fired — prior tests showed it
+            // cascades into full session teardown.
             auto dep_oid = JsonGetString(resp, "OnlineId");
             auto dep_mid = static_cast<u16>(JsonGetInt(resp, "MemberId"));
             LOG_WARNING(Lib_NpMatching2,
@@ -1326,6 +1341,17 @@ static void HandlePollEvent(const std::string& resp) {
                 NpSignaling::DeliverSignalingEvent(g_state.ctx.ctx_id, sig_conn_id,
                                                    NpSignaling::ORBIS_NP_SIGNALING_EVENT_DEAD,
                                                    50);
+            }
+            {
+                auto now_mdead = std::chrono::steady_clock::now();
+                PendingEvent sig_ev{};
+                sig_ev.type = PendingEvent::SIGNALING_CB;
+                sig_ev.fire_at = now_mdead + std::chrono::milliseconds(50);
+                sig_ev.room_id = g_state.ctx.room_id;
+                sig_ev.member_id = dep_mid;
+                sig_ev.sig_event = ORBIS_NP_MATCHING2_SIGNALING_EVENT_DEAD;
+                sig_ev.conn_id = static_cast<u32>(dep_mid);
+                ScheduleEvent(std::move(sig_ev));
             }
             NpSignaling::RemoveConnection(dep_oid);
             auto& kernel = Libraries::Net::KernelP2PSubsystem::Instance();
@@ -2213,28 +2239,52 @@ static bool HandleHostPeerLeftEvent(u16 departed_member_id, const std::string& o
         g_state.known_member_count = static_cast<int>(g_state.peers.size());
     }
 
-    // Fire DEAD(0x0) signaling event for this peer's specific sig conn_id
-    // BEFORE erasing HLE state, so KernelEventBridge delivers the event to
-    // the game's callback. DEAD drives the native SocketState case 0 path
-    // which cascades through ConnObj teardown and resets +0x64, so that
-    // when the peer rejoins, completionHandler will re-run cleanly and
-    // fireCompletionNxrvEvent will re-fire NxrvEvent 0x0e, letting the new
-    // SosSignEntry transition 0→1. Without this, the ConnObj sits at +0x64=2
-    // from the previous session and short-circuits the completion chain on
-    // reconnect, leaving the new SosSignEntry stuck at state=0.
+    // Per-conn teardown events for the departing peer — fire BEFORE erasing
+    // HLE state so the callbacks route correctly. Real libSceNpSignaling /
+    // libSceNpMatching2 fire these on peer departure; the game's native
+    // handlers chain into ConnObj teardown + schedule NxrvEvent 0x0f via
+    // setDoneFlag (10s post-connected StepNode) for game-level cleanup.
     //
-    // This matches real libSceNpSignaling behavior: DEAD is a PER-CONN event,
-    // scoped to exactly this peer's sig_conn_id. Earlier experiments that
-    // cascaded full-session teardown were firing 0x5101 (Connected) or
-    // PEER_DEACTIVATED(0xb), or firing with an unmatched/invalid conn_id;
-    // DEAD(0x0) with a matched sig_conn_id is the clean per-peer teardown.
+    // Two independent callback layers, both needed:
+    //   (a) NpSignaling DEAD(0x0): drives SocketState case 0 → resets ConnObj
+    //       +0x64 so a fresh rejoin's completionHandler can re-fire 0x0e.
+    //   (b) Matching2 SIGNALING_EVENT_DEAD (0x5101): reaches
+    //       mcp_SignalingEvent_dispatch's 0x5101 branch, which sets
+    //       conn->+0xD8=2 and calls setDoneFlag → schedules the ~10s
+    //       StepNode that fires NxrvEvent 0x0f → game-native SosSignEntry
+    //       cleanup (game-agnostic; we don't need to know what SosSignEntry
+    //       is — the game drives its own post-connected cleanup).
+    //
+    // MemberLeft (0x1102) scheduled below is a third path that also hits
+    // setDoneFlag via mcp_RoomEvent_MemberLeft_handler, but it only works
+    // if the ConnObj is still in SO+0x80 at dispatch time — the 0x5101
+    // path is belt-and-suspenders in case that vector has rotated.
     s32 sig_conn_id = NpSignaling::GetSignalingConnId(online_id);
     if (sig_conn_id > 0) {
-        NP_LOG("HandleHostPeerLeftEvent: firing DEAD for sig conn_id={} "
-               "npid='{}' to drive native ConnObj teardown",
+        NP_LOG("HandleHostPeerLeftEvent: firing NpSignaling DEAD for sig "
+               "conn_id={} npid='{}' to drive native ConnObj teardown",
                sig_conn_id, online_id);
         NpSignaling::DeliverSignalingEvent(g_state.ctx.ctx_id, sig_conn_id,
                                            NpSignaling::ORBIS_NP_SIGNALING_EVENT_DEAD, 50);
+    }
+
+    // Fire Matching2 SIGNALING_EVENT_DEAD (0x5101) for the departing peer.
+    // This reaches the game's SignalingEvent_dispatch 0x5101 branch which
+    // calls setDoneFlag → schedules NxrvEvent 0x0f (native SosSignEntry
+    // cleanup). Game-agnostic: just signals "peer is done."
+    {
+        auto now_mdead = std::chrono::steady_clock::now();
+        PendingEvent sig_ev{};
+        sig_ev.type = PendingEvent::SIGNALING_CB;
+        sig_ev.fire_at = now_mdead + std::chrono::milliseconds(50);
+        sig_ev.room_id = g_state.ctx.room_id;
+        sig_ev.member_id = departed_member_id;
+        sig_ev.sig_event = ORBIS_NP_MATCHING2_SIGNALING_EVENT_DEAD;
+        sig_ev.conn_id = static_cast<u32>(departed_member_id);
+        ScheduleEvent(std::move(sig_ev));
+        NP_LOG("HandleHostPeerLeftEvent: scheduled Matching2 DEAD(0x5101) "
+               "for member={} npid='{}' to trigger setDoneFlag → 0x0f",
+               departed_member_id, online_id);
     }
 
     // Fully erase all HLE state for the departed peer (sig conn + kernel P2P
