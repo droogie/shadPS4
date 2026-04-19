@@ -507,20 +507,6 @@ static void KernelEventBridge(s32 ctx_id, s32 conn_id, s32 event, u32 delay_ms) 
                                  cid, conn.npid, conn.state, kern_cid, conn_id);
                         if (kern_cid == conn_id) {
                             sig_conn_id = cid;
-                            // Reset stale non-ACTIVE sig connections -- kernel
-                            // bilateral already confirmed connectivity
-                            if (conn.state != SIG_STATE_ACTIVE && (event == 1 || event == 0xc)) {
-                                conn.state = SIG_STATE_PENDING;
-                                conn.state_start = std::chrono::steady_clock::now();
-                                conn.has_peer_info = true;
-                                conn.bilateral_confirmed = true;
-                                conn.stun_completed = true;
-                                conn.server_confirmed = true;
-                                LOG_INFO(Lib_NpSignaling,
-                                         "KernelEventBridge: reset stale sig conn={} "
-                                         "npid='{}' for ESTABLISHED delivery",
-                                         cid, conn.npid);
-                            }
                             break;
                         }
                     }
@@ -535,6 +521,38 @@ static void KernelEventBridge(s32 ctx_id, s32 conn_id, s32 event, u32 delay_ms) 
                 LOG_INFO(Lib_NpSignaling,
                          "KernelEventBridge: mapped kernel conn_id={} -> sig conn_id={}", conn_id,
                          sig_conn_id);
+            }
+            // On ESTABLISHED, reset the sig conn to PENDING so TickConnection
+            // walks the state machine from scratch and fires a fresh
+            // TransitionToActive -> DeliverSignalingEventForCtx(0x5102).
+            //
+            // Covers two cases:
+            //  (1) First connection: state is non-ACTIVE; reset primes flags so
+            //      the state machine advances 1->3->4->5->7->8->0xa in one tick.
+            //  (2) Reconnect: state is ACTIVE (preserved across DeactivateConnection);
+            //      game expects a fresh callback sequence. Without this reset, the
+            //      state machine sees state=ACTIVE and no-ops, so the game never
+            //      gets the 0x5102 event it's waiting for.
+            //
+            // ESTABLISHED fires once per kernel conn_id from echo bilateral, so
+            // seeing it unambiguously means a fresh activation cycle. Only event==1
+            // drives the reset; MUTUAL_ACTIVATED (0xc) arrives right after and should
+            // not re-reset.
+            if (event == 1) {
+                auto sit = s_sig_connections.find(sig_conn_id);
+                if (sit != s_sig_connections.end()) {
+                    auto prev_state = sit->second.state;
+                    sit->second.state = SIG_STATE_PENDING;
+                    sit->second.state_start = std::chrono::steady_clock::now();
+                    sit->second.has_peer_info = true;
+                    sit->second.bilateral_confirmed = true;
+                    sit->second.stun_completed = true;
+                    sit->second.server_confirmed = true;
+                    LOG_INFO(Lib_NpSignaling,
+                             "KernelEventBridge: reset sig conn={} npid='{}' for ESTABLISHED "
+                             "delivery (prev_state={})",
+                             sig_conn_id, sit->second.npid, prev_state);
+                }
             }
         }
         TickConnection(sig_conn_id, event);
