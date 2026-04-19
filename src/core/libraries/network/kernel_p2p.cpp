@@ -1235,6 +1235,32 @@ void KernelP2PSubsystem::SignalingThreadFunc() {
         };
         std::vector<DeferredAccept> to_accept;
 
+        // If the relay is from a peer whose STUN is already COMPLETE, this is
+        // almost certainly an echo of our own ACCEPT (STUN server mirrors our
+        // ACCEPT request back as a binding response with the peer's USERNAME).
+        // Re-sending ACCEPT for it creates an infinite ping-pong between the
+        // two peers. Skip entirely when the conn is already past STUN setup.
+        bool relay_already_complete = false;
+        {
+            std::lock_guard lock(mutex_);
+            if (!relay_username.empty()) {
+                auto conn_it = npid_to_conn_.find(relay_username);
+                if (conn_it != npid_to_conn_.end()) {
+                    const auto& conn = connections_[conn_it->second];
+                    if (conn.stun_state == StunState::COMPLETE) {
+                        relay_already_complete = true;
+                    }
+                }
+            }
+        }
+        if (relay_already_complete) {
+            LOG_DEBUG(Lib_Net,
+                      "KernelP2P: STUN relay for '{}' -- conn already COMPLETE, "
+                      "ignoring (likely ACCEPT echo, would cause ping-pong)",
+                      relay_username);
+            continue;
+        }
+
         {
             std::lock_guard lock(mutex_);
             PeerConnection* matched_conn = nullptr;
