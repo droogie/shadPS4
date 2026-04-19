@@ -2028,69 +2028,29 @@ void KernelP2PSubsystem::ProcessStunOffer(s32 ctx_id, s32 conn_id, u32 peer_addr
         char mapped_buf[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, &result.mapped_addr, mapped_buf, sizeof(mapped_buf));
         LOG_INFO(Lib_Net,
-                 "KernelP2P: STUN OFFER success -- our mapped={}:{}, "
-                 "waiting for ACCEPT (2s timeout)",
+                 "KernelP2P: STUN OFFER sent -- our mapped={}:{}, "
+                 "ACCEPT will be routed by SignalingThreadFunc USERNAME match",
                  mapped_buf, ntohs(result.mapped_port));
 
-        // Short timeout -- the signaling thread's main loop will catch the
-        // ACCEPT as an incoming relay if we miss it here.
-        auto accept = sc_offer->WaitForRelay(500);
-
-        // Update connection state under lock, then send NAT punch outside lock
-        // (sendto + sleep_for while holding mutex_ starves other threads for ~100ms).
-        u32 punch_addr = 0;
-        u16 punch_port = 0;
+        // Do NOT call WaitForRelay() here to consume the ACCEPT inline. The
+        // shared relay_queue_ is FIFO across peers, so a concurrent OFFER/ACCEPT
+        // from a different peer can be popped here and misrouted to this conn
+        // (stamping the wrong mapped_addr + swallowing the other peer's relay).
+        // The main SignalingThreadFunc loop dequeues relays and matches them to
+        // connections by USERNAME (Strategy 1), which correctly routes each
+        // peer's response regardless of arrival order. NAT punch is also sent
+        // from that loop (to_accept handler).
+        //
+        // Starting echo probes early here keeps NAT pinholes warm while we
+        // wait for the STUN relay to populate the conn's mapped_addr.
         {
             std::lock_guard lock(mutex_);
             auto it = connections_.find(conn_id);
             if (it != connections_.end()) {
-                if (accept.success && accept.mapped_addr != 0) {
-                    it->second.mapped_addr = accept.mapped_addr;
-                    it->second.mapped_port = accept.mapped_port;
-                    // Update primary address so ALL code paths (echo probes,
-                    // game data, GetActivePeerAddr) use the STUN-resolved addr.
-                    it->second.addr = accept.mapped_addr;
-                    it->second.port = accept.mapped_port;
-                    it->second.stun_state = StunState::COMPLETE;
-                    if (it->second.game_activated && !it->second.echo_started) {
-                        it->second.echo_started = true;
-                        it->second.last_echo_sent = {};
-                    }
-                    punch_addr = accept.mapped_addr;
-                    punch_port = accept.mapped_port;
-
-                    char accept_buf[INET_ADDRSTRLEN];
-                    inet_ntop(AF_INET, &accept.mapped_addr, accept_buf, sizeof(accept_buf));
-                    LOG_INFO(Lib_Net,
-                             "KernelP2P: STUN COMPLETE for conn_id={} -- "
-                             "peer verified mapped={}:{} (echo probes will confirm)",
-                             conn_id, accept_buf, ntohs(accept.mapped_port));
-                } else {
-                    it->second.stun_state = StunState::FAILED;
-                    if (it->second.game_activated && !it->second.echo_started) {
-                        it->second.echo_started = true;
-                        it->second.last_echo_sent = {};
-                    }
-                    LOG_WARNING(Lib_Net,
-                                "KernelP2P: STUN FAILED for conn_id={} -- "
-                                "using server-reported addr, echo probes will confirm",
-                                conn_id);
+                if (it->second.game_activated && !it->second.echo_started) {
+                    it->second.echo_started = true;
+                    it->second.last_echo_sent = {};
                 }
-            }
-        }
-
-        // Send NAT punch packets outside lock
-        if (punch_addr != 0) {
-            struct sockaddr_in peer_sa{};
-            peer_sa.sin_family = AF_INET;
-            peer_sa.sin_addr.s_addr = punch_addr;
-            peer_sa.sin_port = punch_port;
-            u8 punch[] = {0xFF, 0xC3, 0x00, 0x00};
-            int fd = sc_offer->GetSocketFd();
-            for (int i = 0; i < 2; i++) {
-                ::sendto(fd, reinterpret_cast<const char*>(punch), sizeof(punch), 0,
-                         reinterpret_cast<struct sockaddr*>(&peer_sa), sizeof(peer_sa));
-                std::this_thread::sleep_for(std::chrono::milliseconds(50));
             }
         }
     } else {
@@ -2103,7 +2063,6 @@ void KernelP2PSubsystem::ProcessStunOffer(s32 ctx_id, s32 conn_id, u32 peer_addr
             auto it = connections_.find(conn_id);
             if (it != connections_.end()) {
                 it->second.stun_state = StunState::FAILED;
-                // Don't set events_fired -- let echo probes/STUN fallback handle it
                 if (it->second.game_activated && !it->second.echo_started) {
                     it->second.echo_started = true;
                     it->second.last_echo_sent = {};
@@ -2115,8 +2074,8 @@ void KernelP2PSubsystem::ProcessStunOffer(s32 ctx_id, s32 conn_id, u32 peer_addr
     // ESTABLISHED is NOT fired from here. Echo probes run at 500ms after STUN
     // completes and fire ESTABLISHED when bilateral confirms or fallback expires.
     LOG_INFO(Lib_Net,
-             "KernelP2P: ProcessStunOffer conn_id={} -- STUN done, "
-             "echo probes will drive ESTABLISHED",
+             "KernelP2P: ProcessStunOffer conn_id={} -- OFFER sent, "
+             "ACCEPT handled by signaling loop",
              conn_id);
 }
 
