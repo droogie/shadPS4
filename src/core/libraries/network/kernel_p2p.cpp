@@ -1235,6 +1235,14 @@ void KernelP2PSubsystem::SignalingThreadFunc() {
         };
         std::vector<DeferredAccept> to_accept;
 
+        // Deferred network I/O for the speculative-ACCEPT (unmatched) path so
+        // we don't hold mutex_ across sendto + sleep (~100ms). Same pattern as
+        // the matched-branch to_accept queue below.
+        bool do_speculative_accept = false;
+        u32 spec_addr = 0;
+        u16 spec_port = 0;
+        std::vector<u8> spec_udata;
+
         {
             std::lock_guard lock(mutex_);
             PeerConnection* matched_conn = nullptr;
@@ -1330,25 +1338,30 @@ void KernelP2PSubsystem::SignalingThreadFunc() {
                             "sending speculative ACCEPT (username='{}' mapped={}:{})",
                             relay_username, mapped_buf, ntohs(relay.mapped_port));
                 if (relay.mapped_addr != 0) {
-                    std::vector<u8> udata;
                     if (!local_npid_.empty()) {
-                        udata.assign(local_npid_.begin(), local_npid_.end());
-                        udata.resize(16, 0);
+                        spec_udata.assign(local_npid_.begin(), local_npid_.end());
+                        spec_udata.resize(16, 0);
                     }
-                    sc->SendAccept(relay.mapped_addr, relay.mapped_port, udata, {0x03});
-
-                    struct sockaddr_in peer_sa{};
-                    peer_sa.sin_family = AF_INET;
-                    peer_sa.sin_addr.s_addr = relay.mapped_addr;
-                    peer_sa.sin_port = relay.mapped_port;
-                    u8 punch[] = {0xFF, 0xC3, 0x00, 0x00};
-                    int fd = sc->GetSocketFd();
-                    for (int i = 0; i < 2; i++) {
-                        ::sendto(fd, reinterpret_cast<const char*>(punch), sizeof(punch), 0,
-                                 reinterpret_cast<struct sockaddr*>(&peer_sa), sizeof(peer_sa));
-                        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-                    }
+                    do_speculative_accept = true;
+                    spec_addr = relay.mapped_addr;
+                    spec_port = relay.mapped_port;
                 }
+            }
+        }
+
+        if (do_speculative_accept) {
+            sc->SendAccept(spec_addr, spec_port, spec_udata, {0x03});
+
+            struct sockaddr_in peer_sa{};
+            peer_sa.sin_family = AF_INET;
+            peer_sa.sin_addr.s_addr = spec_addr;
+            peer_sa.sin_port = spec_port;
+            u8 punch[] = {0xFF, 0xC3, 0x00, 0x00};
+            int fd = sc->GetSocketFd();
+            for (int i = 0; i < 2; i++) {
+                ::sendto(fd, reinterpret_cast<const char*>(punch), sizeof(punch), 0,
+                         reinterpret_cast<struct sockaddr*>(&peer_sa), sizeof(peer_sa));
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
             }
         }
 
