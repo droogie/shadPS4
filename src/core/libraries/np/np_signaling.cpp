@@ -507,6 +507,20 @@ static void KernelEventBridge(s32 ctx_id, s32 conn_id, s32 event, u32 delay_ms) 
                                  cid, conn.npid, conn.state, kern_cid, conn_id);
                         if (kern_cid == conn_id) {
                             sig_conn_id = cid;
+                            // Reset stale non-ACTIVE sig connections -- kernel
+                            // bilateral already confirmed connectivity
+                            if (conn.state != SIG_STATE_ACTIVE && (event == 1 || event == 0xc)) {
+                                conn.state = SIG_STATE_PENDING;
+                                conn.state_start = std::chrono::steady_clock::now();
+                                conn.has_peer_info = true;
+                                conn.bilateral_confirmed = true;
+                                conn.stun_completed = true;
+                                conn.server_confirmed = true;
+                                LOG_INFO(Lib_NpSignaling,
+                                         "KernelEventBridge: reset stale sig conn={} "
+                                         "npid='{}' for ESTABLISHED delivery",
+                                         cid, conn.npid);
+                            }
                             break;
                         }
                     }
@@ -521,38 +535,6 @@ static void KernelEventBridge(s32 ctx_id, s32 conn_id, s32 event, u32 delay_ms) 
                 LOG_INFO(Lib_NpSignaling,
                          "KernelEventBridge: mapped kernel conn_id={} -> sig conn_id={}", conn_id,
                          sig_conn_id);
-            }
-            // On ESTABLISHED, reset the sig conn to PENDING so TickConnection
-            // walks the state machine from scratch and fires a fresh
-            // TransitionToActive -> DeliverSignalingEventForCtx(0x5102).
-            //
-            // Covers two cases:
-            //  (1) First connection: state is non-ACTIVE; reset primes flags so
-            //      the state machine advances 1->3->4->5->7->8->0xa in one tick.
-            //  (2) Reconnect: state is ACTIVE (preserved across DeactivateConnection);
-            //      game expects a fresh callback sequence. Without this reset, the
-            //      state machine sees state=ACTIVE and no-ops, so the game never
-            //      gets the 0x5102 event it's waiting for.
-            //
-            // ESTABLISHED fires once per kernel conn_id from echo bilateral, so
-            // seeing it unambiguously means a fresh activation cycle. Only event==1
-            // drives the reset; MUTUAL_ACTIVATED (0xc) arrives right after and should
-            // not re-reset.
-            if (event == 1) {
-                auto sit = s_sig_connections.find(sig_conn_id);
-                if (sit != s_sig_connections.end()) {
-                    auto prev_state = sit->second.state;
-                    sit->second.state = SIG_STATE_PENDING;
-                    sit->second.state_start = std::chrono::steady_clock::now();
-                    sit->second.has_peer_info = true;
-                    sit->second.bilateral_confirmed = true;
-                    sit->second.stun_completed = true;
-                    sit->second.server_confirmed = true;
-                    LOG_INFO(Lib_NpSignaling,
-                             "KernelEventBridge: reset sig conn={} npid='{}' for ESTABLISHED "
-                             "delivery (prev_state={})",
-                             sig_conn_id, sit->second.npid, prev_state);
-                }
             }
         }
         TickConnection(sig_conn_id, event);
@@ -797,21 +779,29 @@ s32 PS4_SYSV_ABI sceNpSignalingActivateConnection(s32 ctxId, void* npId, s32* co
         for (auto& [id, conn] : s_sig_connections) {
             if (conn.npid == npid_key) {
                 cid = id;
-                // Reset non-ACTIVE stale connection to prevent state machine stalls.
-                if (conn.state != SIG_STATE_ACTIVE) {
-                    conn.state = SIG_STATE_PENDING;
-                    conn.state_start = std::chrono::steady_clock::now();
-                    conn.ctx_id = ctxId;
-                    conn.has_peer_info = false;
-                    conn.bilateral_confirmed = false;
-                    conn.stun_completed = false;
-                    conn.server_confirmed = false;
-                    conn.peer_addr = 0;
-                    conn.peer_port = 0;
-                    LOG_INFO(Lib_NpSignaling,
-                             "ActivateConnection: reset stale conn_id={} npid='{}' -> PENDING", cid,
-                             npid_key);
-                }
+                // Always reset to PENDING when the game explicitly re-activates.
+                // Covers two cases uniformly:
+                //   (1) Stale non-ACTIVE conn -- state machine was mid-setup;
+                //       resetting lets it start over cleanly.
+                //   (2) Reconnect after DeactivateConnection -- state was preserved
+                //       as ACTIVE, but the game's call means it wants a fresh
+                //       activation. Without resetting, the state machine sees
+                //       state=ACTIVE and no-ops, and the game never gets a fresh
+                //       0x5102 (ESTABLISHED) callback.
+                // Safe for idempotent double-activate because the state machine
+                // just walks up 1->3->...->0xa in one tick and fires once.
+                conn.state = SIG_STATE_PENDING;
+                conn.state_start = std::chrono::steady_clock::now();
+                conn.ctx_id = ctxId;
+                conn.has_peer_info = false;
+                conn.bilateral_confirmed = false;
+                conn.stun_completed = false;
+                conn.server_confirmed = false;
+                conn.peer_addr = 0;
+                conn.peer_port = 0;
+                LOG_INFO(Lib_NpSignaling,
+                         "ActivateConnection: reset conn_id={} npid='{}' -> PENDING", cid,
+                         npid_key);
                 break;
             }
         }
